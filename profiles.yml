@@ -1,0 +1,9 @@
+package_health:
+  outputs:
+    dev:
+      type: duckdb
+      path: packages.duckdb
+      threads: 1
+      settings:
+        TimeZone: UTC   # GitHub timestamps are UTC; bucket months in UTC, not local time
+  target: dev

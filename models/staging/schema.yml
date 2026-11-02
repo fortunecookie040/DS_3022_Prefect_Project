@@ -1,0 +1,135 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw GitHub API records loaded by Task 2 (one row per record, full JSON in payload)."
+    schema: main
+    tables:
+      - name: raw_commits
+        description: "One row per commit. id = sha."
+      - name: raw_pull_requests
+        description: "One row per pull request. id = PR number."
+      - name: raw_pr_reviews
+        description: "One row per PR review. id = review id."
+      - name: raw_releases
+        description: "One row per release. id = release id."
+
+models:
+  - name: stg_commits
+    description: >
+      Typed, deduplicated commits. Bot rule: is_bot = author.type = 'Bot' OR
+      author.login LIKE '%[bot]'; false when the author is not a linked GitHub account.
+    columns:
+      - name: commit_key
+        description: "Primary key: repo || ':' || sha."
+        data_tests: [unique, not_null]
+      - name: repo
+        description: "owner/name"
+        data_tests: [not_null]
+      - name: sha
+        description: "Commit SHA (natural key)."
+        data_tests: [not_null]
+      - name: author_login
+        description: "GitHub login of the commit author; null when the commit email isn't linked to an account."
+      - name: is_bot
+        description: "Bot rule applied to the commit author."
+      - name: committed_at
+        description: "commit.author.date as TIMESTAMPTZ (UTC)."
+        data_tests: [not_null]
+      - name: fetched_at
+        description: "When the record was fetched from GitHub."
+
+  - name: stg_pull_requests
+    description: "Typed, deduplicated pull requests (all creation dates). Bot rule applied to the PR author."
+    columns:
+      - name: pr_key
+        description: "Primary key: repo || '#' || pr_number."
+        data_tests: [unique, not_null]
+      - name: repo
+        description: "owner/name"
+        data_tests: [not_null]
+      - name: pr_number
+        description: "PR number (natural key within a repo)."
+        data_tests: [not_null]
+      - name: author_login
+        description: "Login of the PR author (user.login)."
+      - name: is_bot
+        description: "Bot rule applied to the PR author."
+      - name: state
+        description: "open or closed (merged PRs are closed with merged_at set)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed']
+      - name: created_at
+        description: "When the PR was opened."
+        data_tests: [not_null]
+      - name: updated_at
+        description: "Last activity on the PR."
+      - name: closed_at
+        description: "When the PR was closed (merged or not); null if open."
+      - name: merged_at
+        description: "When the PR was merged; null if never merged."
+      - name: fetched_at
+        description: "When the record was fetched from GitHub."
+
+  - name: stg_pr_reviews
+    description: "Typed, deduplicated, submitted PR reviews (PENDING dropped). Bot rule applied to the reviewer."
+    columns:
+      - name: review_key
+        description: "Primary key: repo || ':' || review_id."
+        data_tests: [unique, not_null]
+      - name: repo
+        description: "owner/name"
+      - name: review_id
+        description: "GitHub review id (natural key)."
+        data_tests: [not_null]
+      - name: pr_number
+        description: "PR number parsed from the trailing number of pull_request_url."
+        data_tests: [not_null]
+      - name: pr_key
+        description: "repo || '#' || pr_number; foreign key to stg_pull_requests."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_pull_requests')
+                field: pr_key
+      - name: reviewer_login
+        description: "Login of the reviewer; null for deleted (ghost) users."
+      - name: is_bot
+        description: "Bot rule applied to the reviewer."
+      - name: state
+        description: "Review outcome."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']
+      - name: submitted_at
+        description: "When the review was submitted."
+        data_tests: [not_null]
+      - name: fetched_at
+        description: "When the record was fetched from GitHub."
+
+  - name: stg_releases
+    description: "Typed, deduplicated, published releases (drafts dropped)."
+    columns:
+      - name: release_key
+        description: "Primary key: repo || ':' || release_id."
+        data_tests: [unique, not_null]
+      - name: repo
+        description: "owner/name"
+      - name: release_id
+        description: "GitHub release id (natural key)."
+        data_tests: [not_null]
+      - name: tag_name
+        description: "Git tag of the release."
+      - name: published_at
+        description: "When the release was published."
+        data_tests: [not_null]
+      - name: is_prerelease
+        description: "GitHub's prerelease flag."
+      - name: fetched_at
+        description: "When the record was fetched from GitHub."

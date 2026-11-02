@@ -1,0 +1,17 @@
+storage*
+github*
+CLAUDE.md
+data/
+*.duckdb
+*.duckdb.wal
+logs/
+*.log
+target/
+dbt_packages/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.prefect/
+.user.yml
