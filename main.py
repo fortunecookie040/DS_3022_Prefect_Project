@@ -5,7 +5,7 @@
 from prefect import flow, task, get_run_logger
 from pathlib import Path
 from contextlib import contextmanager
-import httpx, json, os, time, duckdb, logging
+import httpx, json, os, time, duckdb, logging, shutil, functools
 from datetime import datetime, timezone
 from dbt.cli.main import dbtRunner
 
@@ -30,6 +30,8 @@ ENDPOINT_TABLES = {
     "releases": "raw_releases",
 }
 
+REQUEST_COUNT = {"total": 0}        # API odometer: every HTTP call to GitHub this run
+
 # Helper functions go here
 @contextmanager
 def task_log_file(name):
@@ -47,6 +49,32 @@ def task_log_file(name):
     finally:
         logger.logger.removeHandler(handler)
         handler.close()
+
+
+def log_to_file(name):
+    """Run the whole task inside task_log_file(name) without re-indenting its body."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with task_log_file(name):
+                return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def read_watermarks():
+    """Newest updated_at per (repo, endpoint) from _load_state; {} on the first run."""
+    if not DATABASE.exists():
+        return {}
+    con = duckdb.connect(str(DATABASE), read_only=True)
+    try:
+        rows = con.execute("SELECT repo, endpoint, newest_updated_at FROM _load_state").fetchall()
+    except duckdb.CatalogException:          # database exists but Task 2 never finished
+        return {}
+    finally:
+        con.close()
+    return {(repo, endpoint): ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+            for repo, endpoint, ts in rows if ts is not None}
 
 
 def get_record_id(endpoint, record):
@@ -72,6 +100,7 @@ def get_page(url, headers, max_tries=5):
     tries = 0
     while True:
         try:
+            REQUEST_COUNT["total"] += 1
             response = httpx.get(url, headers=headers, timeout=60)
         except httpx.TransportError:
             tries += 1
@@ -145,7 +174,7 @@ def save_page(filename, repo, endpoint, page, url, data, next_url, pr_number=Non
     tmp.replace(filename)          # atomic: a crash never leaves a partial page
 
 
-def get_all_pages(repo, endpoint, url, headers, pr_number=None, stop_field=None):
+def get_all_pages(repo, endpoint, url, headers, pr_number=None, stop_field=None, stop_before=START_DATE):
     logger = get_run_logger()
     page, total = 1, 0
 
@@ -166,17 +195,19 @@ def get_all_pages(repo, endpoint, url, headers, pr_number=None, stop_field=None)
 
         # PRs are sorted by updated desc: once the oldest record on this
         # page is before the window, nothing further is needed.
-        if stop_field and data and data[-1][stop_field] < START_DATE:
+        if stop_field and data and data[-1][stop_field] < stop_before:
             next_url = None
 
         save_page(filename, repo, endpoint, page, url, data, next_url, pr_number)
         total += len(data)
         url, page = next_url, page + 1
 
-    logger.info(f"{repo} {endpoint}{'#' + str(pr_number) if pr_number else ''}: {total} records")
+    logger.debug(f"{repo} {endpoint}{'#' + str(pr_number) if pr_number else ''}: {total} records")
+    if pr_number is None:
+        logger.info(f"{repo} {endpoint}: {total} records")
     return total
 
-def get_pull_requests(repo):
+def get_pull_requests(repo, updated_since=START_DATE):
     folder = RAW_DIR / repo.replace("/", "__") / "pulls"
     pull_requests = []
 
@@ -187,47 +218,66 @@ def get_pull_requests(repo):
             continue
 
         for pr in saved["data"]:
-            if pr["created_at"] >= START_DATE:
+            if pr["created_at"] >= START_DATE and pr["updated_at"] >= updated_since:
                 pull_requests.append(pr)
 
     return pull_requests
 
-@task(retries=3, retry_delay_seconds=30)
+@task(retries=3, retry_delay_seconds=[30, 60, 120])
+@log_to_file("extract")
 def extract():
     # talks to github and writes files
     # It never writes to DuckDB. Its job is to get every page of every endpoint onto disk, without exceeding the rate limit and without losing work if the run is interrupted.
     logger = get_run_logger()
+    REQUEST_COUNT["total"] = 0
 
     token = os.environ.get("TOKEN")
 
     if not token:
-        raise ValueError("Please set github_token first.")
+        raise ValueError("Please set the TOKEN environment variable to your GitHub PAT first.")
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json"
     }
 
+    marker = RAW_DIR / "_LOADED"
+    if marker.exists():
+        logger.info("Found _LOADED: everything on disk is in DuckDB -> starting fresh "
+                    "(deleting data/raw, fetching only records newer than _load_state)")
+        shutil.rmtree(RAW_DIR)
+    elif RAW_DIR.exists():
+        logger.info("No _LOADED: last run did not finish loading -> resuming, "
+                    "reusing pages already on disk")
+    watermarks = read_watermarks()
+    logger.info(f"Mode: {'incremental' if watermarks else 'full window'} run")
+    requests_by_repo = {}
+
     for repo in REPOS:
         logger.info(f"Starting extraction for {repo}")
+        repo_start = REQUEST_COUNT["total"]
 
-        base_url = f"https://api.github.com/repos/{repo}"
+        base_url = f"{API_BASE}/repos/{repo}"
 
         # Download commits
+        commits_since = watermarks.get((repo, "commits"), START_DATE)
         commits_url = (
-            f"{base_url}/commits?since={START_DATE}&per_page=100"
+            f"{base_url}/commits?since={commits_since}&per_page=100"
         )
         get_all_pages(repo, "commits", commits_url, headers)
 
         # Download pull requests
+        pulls_cutoff = watermarks.get((repo, "pulls"), START_DATE)
         pulls_url = (
-            f"{base_url}/pulls?state=all&sort=created"
+            f"{base_url}/pulls?state=all&sort=updated"
             f"&direction=desc&per_page=100"
         )
-        get_all_pages(repo, "pulls", pulls_url, headers)
+        get_all_pages(repo, "pulls", pulls_url, headers,
+                      stop_field="updated_at", stop_before=pulls_cutoff)
 
         # Download reviews for each PR since January 2024
-        pull_requests = get_pull_requests(repo)
+        pull_requests = get_pull_requests(repo, updated_since=pulls_cutoff)
+        review_total = 0
 
         for pr in pull_requests:
             number = pr["number"]
@@ -235,18 +285,22 @@ def extract():
                 f"{base_url}/pulls/{number}/reviews?per_page=100"
             )
 
-            get_all_pages(
+            review_total += get_all_pages(
                 repo, "pr_reviews", reviews_url,
                 headers, pr_number=number
             )
+        logger.info(f"{repo} pr_reviews: {review_total} records across {len(pull_requests)} PRs")
 
         # Download releases
         releases_url = f"{base_url}/releases?per_page=100"
         get_all_pages(repo, "releases", releases_url, headers)
 
-        logger.info(f"Finished extraction for {repo}")
+        requests_by_repo[repo] = REQUEST_COUNT["total"] - repo_start
+        logger.info(f"Finished extraction for {repo} ({requests_by_repo[repo]} API requests)")
 
+    logger.info(f"Total API requests this run: {REQUEST_COUNT['total']}")
     logger.info("Task 1 extraction complete!")
+    return {"requests_by_repo": requests_by_repo, "total_requests": REQUEST_COUNT["total"]}
 
 @task(retries=2, retry_delay_seconds=10)
 def load():
