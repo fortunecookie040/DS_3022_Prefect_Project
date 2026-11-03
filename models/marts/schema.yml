@@ -140,5 +140,7 @@ models:
         description: "Contributor base. Average distinct non-bot PR authors per complete month. Higher is healthier."
       - name: contributor_trend
         description: "Contributor trend. regr_slope(active_contributors, month_index) over complete months. Higher is healthier."
+      - name: contributor_trend_pct
+        description: "Contributor trend, size-normalized: contributor_trend / average monthly active contributors (fractional change per month). Higher is healthier."
       - name: bus_factor
         description: "Contributor base. Fewest authors accounting for >= 50% of merged human PRs. Higher is healthier."

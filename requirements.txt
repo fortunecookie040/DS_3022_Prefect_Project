@@ -3,3 +3,6 @@ dbt-duckdb==1.11.1
 prefect==3.9.0
 httpx==0.28.1
 duckdb==2.0.0
+pandas==2.3.3
+numpy==2.5.4
+matplotlib==3.10.7

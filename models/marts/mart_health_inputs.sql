@@ -103,6 +103,7 @@ select
     -- Contributor base
     m.active_contributors_per_month,
     m.contributor_trend,
+    m.contributor_trend / nullif(m.active_contributors_per_month, 0) as contributor_trend_pct,  -- size-normalized slope
     b.bus_factor
 from repos r
 cross join run
