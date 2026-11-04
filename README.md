@@ -1,313 +1,413 @@
-# Data Project 2 // Open Source Package Health: GitHub Data Pipeline
+# Open Source Package Health: GitHub Data Pipeline
 
-Released: Oct 23, 2026 | Due: Nov 02, 2026
+**DS 3022 · Data Project 2 · Package set B** — `scikit-learn/scikit-learn`, `dask/dask`, `plotly/plotly.py`
 
-> **Before you submit**, work through the [submission checklist](CHECKLIST.md). It lists every deliverable and what to submit in Canvas: your repository URL, and which extended items you attempted.
+One Prefect flow (`qtr7bs-package-health-flow` in `main.py`) pulls GitHub activity for three data science packages, loads it into DuckDB, transforms and tests it with dbt, validates it in Python, scores each repository's community health, and plots the results. The analysis window is **2024-01-01 through the time of each run**.
 
-## Overview
-
-In this project students will build one Prefect flow that pulls GitHub activity for three data science packages and ranks them from healthiest to least healthy development community. The project is worth **100 points**: **82** core, **8** extended, and **10** for an oral interview.
-
-The flow must run end to end from a single entry point and contain six tasks: (1) extract from the GitHub API to JSON files, (2) load into DuckDB, (3) build and test staging, fact, and mart models with `dbt`, (4) validate the results in Python (no `dbt`), (5) model and rank, (6) plot. Task 3 is the only task that runs `dbt`. Each task is graded on its own, and each is designed to require real problem solving rather than a single library call.
-
-Analysis window: **2024-01-01 through the time of each run.** The start date is fixed and shared by all projects; the end is open, so the window grows with every run (34 months as of October 2026). There is no end date to configure: anything GitHub returns already falls before the run.
-
-```mermaid
-flowchart LR
-    api[(GitHub API)] --> t1
-    subgraph flow [Prefect flow]
-        direction LR
-        t1["<b>1 · Extract</b><br/>4 endpoints × 3 repos<br/>data/raw/"] --> t2["<b>2 · Load</b><br/>4 raw_* tables<br/>packages.duckdb"] --> t3["<b>3 · dbt build</b><br/>4 stg, 2 fct, 2 mart<br/>+ tests"] --> t4["<b>4 · Validation</b><br/>(Python)<br/>checks, outliers,<br/>statistics"] --> t5["<b>5 · Model</b><br/>health scores<br/>+ ranking"] --> t6["<b>6 · Plot</b><br/>PNGs<br/>plots/"]
-    end
-    classDef box fill:#ffffff,stroke:#6b7280,color:#111827
-    class api,t1,t2,t3,t4,t5,t6 box
-    style flow fill:#f3f4f6,stroke:#9ca3af,color:#111827
-    linkStyle default stroke:#4b5563
-```
-
-## Package selection
-
-Students will choose one of three preassigned sets of packages. Fixed sets equalize the API workload and guarantee a spread of community sizes so the ranking has something to find.
-
-Each set mixes one large project with two smaller ones. The sets are balanced at roughly 7,000 PRs created and 5,500 PRs merged each across the analysis window (as of October 2026).
-
-| Set | Large (heavy pagination) | Smaller |
-| --- | --- | --- |
-| A | `numpy/numpy` | `networkx/networkx`, `statsmodels/statsmodels` |
-| B | `scikit-learn/scikit-learn` | `dask/dask`, `plotly/plotly.py` |
-| C | `matplotlib/matplotlib` | `pydata/xarray`, `lightgbm-org/LightGBM` |
-
-Indicate your selection A, B, or C in the Canvas quiz form.
-
-## Create your repository
-
-Do not fork this repository. Create your own copy from the template:
-
-1. At the top of this repository's page, click **Use this template** → **Create a new repository**.
-2. Set **Owner** to your personal GitHub account and give the repository a name.
-3. Under visibility, select **Private**. GitHub may preselect **Public**; change it before continuing.
-4. Click **Create repository**.
-5. In your new repository, go to **Settings** → **Collaborators** → **Add people** and add `nmagee`, `elaineliu05`, and `tcusick8`.
-6. Clone your new repository and do all of your work there.
-
-> **Your repository must be private.** If you created it as public, change it now: **Settings** → **General** → **Danger Zone** → **Change repository visibility** → **Private**.
-
-## General requirements — 13 points
-
-| Criterion | Full credit requires | Pts |
-| --- | --- | --- |
-| Submission | All code, README, and plots are committed by the deadline in a **private** repository created from this template, with instructional staff added as collaborators (see [Create your repository](#create-your-repository)). | 1 |
-| Single Prefect flow | One `@flow` orchestrates the six (6) core tasks in order; running the flow executes the whole pipeline, including `dbt build` (Task 3). The six tasks are the backbone of the flow: helper tasks (e.g. a per-request fetch with its own retries, or a task mapped over repos) and subflows are allowed to carry out the work of any of the six. Helper functions and classes may live in additional Python modules imported by the flow. | 3 |
-| Execution | The flow runs to completion from a clean clone with only a GH token; experiences no unhandled exceptions. | 2 |
-| Secrets | The GitHub PAT is read from an environment variable or Prefect Secret block; no token appears anywhere in the repository or its history. | 1 |
-| Retries and error handling | Tasks use Prefect retries with backoff where failure is transient; HTTP and parsing errors are caught and handled with context. | 2 |
-| Logging | Each task logs through the Prefect logger AND to its own log file in the project directory (dbt's own log should also be saved). | 1 |
-| Code quality | Functions should be well-formed with `return`, appropriate flow control, and not unnecessarily verbose; files organized into folders (flow, dbt, plots). | 1 |
-| Reproducibility | Dependencies pinned in `requirements.txt`, `Pipfile`, or `pyproject.toml`; README explains setup, run command, and expected runtime. | 1 |
-| No cruft | The repository contains no database files, log files, raw API dumps, or caches. It contains no binaries, `venv` folder or virtualenv artifacts apart from dependency manifests (above) | 1 |
-
-## How Tasks 1 and 2 fit together
-
-Tasks 1 and 2 split the work of getting data from GitHub into DuckDB into two separate jobs:
+The original assignment instructions are in [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
 ```
-GitHub API ──Task 1: Extract──▶ data/raw/*.json ──Task 2: Load──▶ packages.duckdb (raw_* tables) ──Task 3: dbt──▶ marts
+GitHub API ─▶ 1 Extract ─▶ data/raw/*.json ─▶ 2 Load ─▶ packages.duckdb (raw_*) ─▶ 3 dbt build ─▶ stg_* / fct_* / mart_*
+                                                                                                     │
+                                                         plots/*.png ◀─ 6 Plot ◀─ 5 Model ◀─ 4 Validate
 ```
 
-- **Task 1 only talks to GitHub and writes files.** It never writes to DuckDB. Its job is to get every page of every endpoint onto disk, without exceeding the rate limit and without losing work if the run is interrupted.
-- **Task 2 only reads files and writes to DuckDB.** It never calls the API. Its job is to load the landed files into raw tables so that re-running it never creates duplicates.
+---
 
-Because the raw responses stay on disk, you can fix a bug in Task 2 or any `dbt` model and rerun it without spending API quota. Add `data/` to `.gitignore`; landed data files must never be committed (see *No cruft* above).
+## Setup and running
 
-> **A note on design**: Any task can be run in parallel using Prefect's `.map` feature. And, since you are working on 3 repositories at once, your code can theoretically work on more than one repo at a time, fetching multiple sources of data at the same time for each.
+**Requirements:** Python 3.13 (the version this was developed and tested on), a GitHub personal access token, and a Prefect API to report to (the class server or a local `prefect server start`).
 
-## Task 1: Extract from GitHub — 16 points
+```bash
+git clone <this repo> && cd DS_3022_Prefect_Project
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt          # pinned: prefect, dbt-core, dbt-duckdb, duckdb, httpx, pandas, numpy, matplotlib
 
-> **Build your flow** in the `main.py` module. All flow and logic should be there, unless you incorporate other modules via import.
+export TOKEN=ghp_your_token_here         # read by extract(); never stored in the repo
+python main.py
+```
 
-Pull every required endpoint for all three repositories, across every page, and write each response page to disk as a JSON file. Restrict to the analysis window wherever the endpoint supports it (`since` for commits; no `until` is needed because the window runs through the present). Pull requests have no date filter: sort by `updated` descending and stop paginating once you pass the window start. Releases are small enough to fetch in full.
+**Expected runtime**
 
-Example URL using `since`:
+| Run | What happens | Time | API requests |
+| --- | --- | --- | --- |
+| First / full run | No `packages.duckdb` and no `data/raw/`: fetches the whole window | **~1 hour** (my full run: 15:57 → 16:58). Can be longer if the 5,000/hour limit is hit and the flow sleeps until the reset | ~7,200 |
+| Incremental run | `data/raw/_LOADED` exists: fetches only records changed since the last load | **~1 minute** (extract ~25–50 s, tasks 2–6 ~6 s) | 44–115 |
 
-    https://api.github.com/repos/numpy/numpy/commits?since=2024-01-01T00:00:00Z&per_page=100
+Keep the machine awake for a full run (e.g. `caffeinate -i python main.py` on macOS).
 
-**Required endpoints** (per repo; `{r}` = `owner/name`):
+**Outputs**
 
-| Endpoint | Path | Notes |
-| --- | --- | --- |
-| Commits | `GET /repos/{r}/commits?since=…` | |
-| Pull requests | `GET /repos/{r}/pulls?state=all&sort=updated&direction=desc` | |
-| PR reviews | `GET /repos/{r}/pulls/{number}/reviews` | One call per PR created in the window, merged or not (first review time). |
-| Releases | `GET /repos/{r}/releases` | |
+- `packages.duckdb` — raw tables, `_load_state`, dbt models, `health_scores`, `health_metric_scores` (git-ignored; rebuilt by the flow)
+- `logs/extract.log`, `load.log`, `build_test.log`, `validate.log`, `model.log`, `plot.log`, and dbt's own `logs/dbt.log` (git-ignored)
+- `plots/*.png` — committed
 
-You may add other endpoints if you use them in a metric.
+> **Harmless exit message:** duckdb 2.0's Python bindings sometimes print `nanobind: leaked N instances!` as the interpreter shuts down. It appears *after* the flow has finished, refers to duckdb's own built-in type objects, and does not affect any results.
 
-**Landing format.** Write one file per response page:
+**Repository layout**
+
+| Path | Contents |
+| --- | --- |
+| `main.py` | The Prefect flow and all six tasks |
+| `dbt_project.yml`, `profiles.yml` | dbt project config (profile points at `packages.duckdb`, UTC timezone) |
+| `models/staging/`, `models/marts/` | dbt models and their `schema.yml` documentation/tests |
+| `macros/helpers.sql` | Shared dbt macros: `is_bot`, `run_time`, `window_start`, `hours_between` |
+| `tests/` | dbt singular tests |
+| `plots/` | Task 6 output |
+| `requirements.txt` | Pinned dependencies |
+
+---
+
+## Task 1 — Extract from GitHub
+
+`extract()` only talks to GitHub and writes files; it never touches DuckDB.
+
+**Endpoints (per repo).** Commits (`/commits?since=…`), pull requests (`/pulls?state=all&sort=updated&direction=desc`), PR reviews (`/pulls/{number}/reviews`, one call per PR created in the window, merged or not), and releases (`/releases`, fetched in full). Every request uses `per_page=100`.
+
+**Pagination.** `get_all_pages()` follows the `Link` header's `rel="next"` URL until there is none. For pull requests, which have no date filter, it stops once the oldest PR on a page was last updated before the window start (or, on an incremental run, before the watermark). Record counts are logged per endpoint per repo.
+
+**Rate limiting and HTTP errors** (`get_page()`):
+
+- Reads `X-RateLimit-Remaining` and `X-RateLimit-Reset` on **every** response; when 5 or fewer requests remain it sleeps until the reset time (+5 s) *before* the budget reaches zero.
+- 403/429 secondary limits: sleeps until the reset if the budget is exhausted, otherwise honours `Retry-After`.
+- Network errors and 5xx responses: exponential backoff (2, 4, 8, 16 s), up to 5 tries.
+- Anything still failing raises, and the task-level Prefect retries take over: `@task(retries=3, retry_delay_seconds=[30, 60, 120])`. Because pages already on disk are reused, a retry never re-spends quota.
+
+**Landing format.** One file per response page:
 
 ```
 data/raw/<owner>__<repo>/<endpoint>/page_0001.json
+data/raw/<owner>__<repo>/pr_reviews/<pr_number>/page_0001.json   # reviews: one subfolder per PR
 ```
 
-Each file is a JSON object with the request metadata and the unmodified response body:
+Reviews get a subfolder per PR because every PR's reviews start at page 1; without it the files would overwrite each other. Each file holds the request metadata and the unmodified response body:
 
 ```json
 {
-  "repo": "numpy/numpy",
+  "repo": "dask/dask",
   "endpoint": "pulls",
-  "url": "https://api.github.com/repos/numpy/numpy/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1",
+  "url": "https://api.github.com/repos/dask/dask/pulls?state=all&sort=updated&direction=desc&per_page=100",
   "page": 1,
-  "fetched_at": "2026-11-02T14:03:11Z",
+  "fetched_at": "2026-11-03T21:42:01Z",
+  "next_url": "https://api.github.com/repositories/.../pulls?...&page=2",
   "data": [ ... ]
 }
 ```
 
-**Resume or start fresh?** Task 2 creates an empty marker file, `data/raw/_LOADED`, once everything in `data/raw/` has been loaded into DuckDB:
+`next_url` (and `pr_number` for reviews) are extra fields that let a resumed run continue pagination from disk.
 
-```python
-Path("data/raw/_LOADED").touch()
+**Resume or start fresh.** At the start of each run `extract()` checks `data/raw/_LOADED`, which Task 2 creates only after a committed load:
+
+| Found | Meaning | Action |
+| --- | --- | --- |
+| No `data/raw/` | First run | Fetch the full window |
+| `data/raw/` but no `_LOADED` | Last run stopped before loading | **Resume**: keep files, skip pages already on disk |
+| `_LOADED` | Everything on disk is in DuckDB | **Start fresh**: delete `data/raw/`, fetch only records newer than the `_load_state` watermarks |
+
+**Half-written pages.** `save_page()` writes to a `.tmp` file and renames it into place (`Path.replace`, atomic), so a crash can never leave a partial `page_*.json`. If a page file still fails to parse, `read_saved()` returns `None` and that one page is re-fetched; every other page is reused.
+
+### Resumability evidence
+
+I interrupted my full run with Ctrl-C during scikit-learn's review calls and started it again (`logs/extract.log`):
+
+**Interrupted run**
+
+```
+2026-11-03 15:57:04,594 | INFO | Mode: full window run
+2026-11-03 15:57:04,595 | INFO | Starting extraction for scikit-learn/scikit-learn
+2026-11-03 15:57:22,629 | INFO | scikit-learn/scikit-learn commits: 3363 records
+2026-11-03 15:58:49,682 | INFO | scikit-learn/scikit-learn pulls: 6400 records
+^C   (interrupted while fetching per-PR reviews)
 ```
 
-At the start of each run, Task 1 checks for that file:
+**Resumed run** — no `_LOADED`, so the pages on disk were reused: commits and pulls finished in under a second with no API calls, and review fetching continued from where it stopped.
 
-| What Task 1 finds | What it means | What Task 1 does |
-| --- | --- | --- |
-| No `_LOADED` file | The last run stopped before everything was loaded | **Resume:** keep the files, skip pages already on disk, fetch the rest |
-| `_LOADED` file present | Everything on disk is already safe in DuckDB | **Start fresh:** delete `data/raw/`, then fetch only records updated since the `_load_state` watermark (see Task 2) |
+```
+2026-11-03 15:59:44,980 | INFO | No _LOADED: last run did not finish loading -> resuming, reusing pages already on disk
+2026-11-03 15:59:44,981 | INFO | Mode: full window run
+2026-11-03 15:59:44,981 | INFO | Starting extraction for scikit-learn/scikit-learn
+2026-11-03 15:59:45,025 | INFO | scikit-learn/scikit-learn commits: 3363 records
+2026-11-03 15:59:45,306 | INFO | scikit-learn/scikit-learn pulls: 6400 records
+2026-11-03 16:41:51,081 | INFO | scikit-learn/scikit-learn pr_reviews: 18334 records across 5227 PRs
+2026-11-03 16:41:51,491 | INFO | scikit-learn/scikit-learn releases: 51 records
+2026-11-03 16:41:51,493 | INFO | Finished extraction for scikit-learn/scikit-learn (5121 API requests)
+...
+2026-11-03 16:58:08,306 | INFO | Total API requests this run: 7107
+2026-11-03 16:58:08,306 | INFO | Task 1 extraction complete!
+```
 
-On the very first run there is no `data/raw/` and no `_load_state`, so Task 1 fetches the full window.
+---
 
-| Criterion | Full credit requires | Pts |
-| --- | --- | --- |
-| Required endpoints | Every endpoint in the table above is fetched for all three repos. | 3 |
-| Review calls | Reviews are fetched for every PR created in the window, merged or not. These per-PR calls multiply your request volume and are what push each set past the hourly limit. | 3 |
-| Pagination | Follows the `Link` header (`rel="next"`) with `per_page=100` until no next page remains. Record counts are logged per endpoint per repo. | 3 |
-| Primary rate limit | Reads `X-RateLimit-Remaining` and `X-RateLimit-Reset` on every response and sleeps until the reset time before the budget reaches zero. The 5,000 requests/hour limit cannot be raised. | 3 |
-| Other HTTP errors | Handles 403/429 (secondary rate limits; honor `Retry-After`) and 5xx errors using Prefect `retries` and `retry_delay_seconds` on the appropriate task(s). | 1 |
-| Landing files | Every response page is written in the format above, with exactly one file per page. | 1 |
-| Resumability | If a run is interrupted, the next run sees no `_LOADED` file, keeps what is in `data/raw/`, and skips pages already on disk instead of starting over. Show this in your README with log excerpts from an interrupted run and its resumed run. Tip: interrupt your first full run partway through (Ctrl-C) and restart it; resuming costs no extra quota. Consider what happens if a crash lands while a page file is half-written: your resume logic should be able to recover from that without re-fetching what it already has (for example, by writing to a temp file and renaming it when complete, or by re-fetching only pages that fail to parse). | 2 |
+## Task 2 — Load to DuckDB
 
-## Task 2: Load to DuckDB — 9 points
+`load()` only reads files and writes to DuckDB; it never calls the API.
 
-Read the landed JSON files in `data/raw/` and load them into raw tables in `packages.duckdb`. `dbt` builds everything downstream from these tables in Task 3.
+**Raw tables.** One table per endpoint — `raw_commits`, `raw_pull_requests`, `raw_pr_reviews`, `raw_releases` — with one row per record:
 
-**Raw table design.** Create one table per endpoint (`raw_commits`, `raw_pull_requests`, `raw_pr_reviews`, and so on). Each row is **one record** (one commit, one PR, one review), not one page. Each table has a few typed key columns and the full record as JSON:
-
-| Column | Type | Description |
+| Column | Type | Source |
 | --- | --- | --- |
 | `repo` | VARCHAR | `owner/name` |
-| `id` | VARCHAR or BIGINT | The record's natural key (see below) |
-| `updated_at` | TIMESTAMP | From the record, where it has one |
+| `id` | VARCHAR | Natural key: commits → `sha`, PRs → `number`, reviews and releases → `id` |
+| `updated_at` | TIMESTAMP | PRs: `updated_at`; commits: `commit.committer.date` (what `since` filters on); reviews: `submitted_at`; releases: `published_at` |
 | `fetched_at` | TIMESTAMP | From the landing file |
-| `source_file` | VARCHAR | Path of the landing file the row came from |
+| `source_file` | VARCHAR | Path of the landing file |
 | `payload` | JSON | The complete record as returned by GitHub |
 
-Natural keys: commits → `sha`; PRs → `number`; reviews and releases → `id`. Primary key is `(repo, id)`.
+Primary key: `(repo, id)`. All other fields stay in `payload`, so dbt can extract new fields without re-fetching.
 
-Leave the remaining fields inside `payload`. Your `dbt` staging models (Task 3) extract the fields you need, so if you later find you need another field you only change a model, not re-fetch from the API.
+**How a load works.**
 
-**Load state.** Keep a `_load_state` table with one row per repo and endpoint, recording the newest `updated_at` loaded and when the load finished. Update it only after every file in `data/raw/` has loaded, and then create the `_LOADED` marker (see *Resume or start fresh?* in Task 1). On the next run, Task 1 reads `_load_state` to set `since` and to decide where to stop paginating. Think of this table as tracking every successful action in this task, so that any hiccup does not require a full restart.
+1. Every landing file is read and validated **before** the database is touched (malformed JSON, unknown repo/endpoint, or a non-list `data` raises an error naming the file).
+2. All four tables are upserted in **one transaction**: rows are bulk-inserted into a temp table, de-duplicated (a record can appear on two pages if it changed mid-pagination; the newest copy wins), then `INSERT … ON CONFLICT (repo, id) DO UPDATE`. Never blind inserts.
+3. `_load_state` (one row per repo × endpoint: newest `updated_at` loaded and `loaded_at`) is updated in the same transaction, so the watermark only moves if every file loaded.
+4. After `COMMIT`, `data/raw/_LOADED` is created. Any failure rolls back and leaves no marker, so the next run resumes instead of discarding unloaded pages.
 
-| Criterion | Full credit requires | Pts |
+### Idempotent loads: running Task 2 twice on the same files
+
+From `logs/load.log` — the second load of the same 7,490 files changed nothing:
+
+```
+2026-11-02 12:11:55 | raw_commits:       0     rows before -> 7533  rows after (+7533)
+2026-11-02 12:11:55 | raw_pull_requests: 0     rows before -> 30776 rows after (+30776)
+2026-11-02 12:11:55 | raw_pr_reviews:    0     rows before -> 21818 rows after (+21818)
+2026-11-02 12:11:55 | raw_releases:      0     rows before -> 204   rows after (+204)
+2026-11-02 12:12:08 | raw_commits:       7533  rows before -> 7533  rows after (+0)
+2026-11-02 12:12:08 | raw_pull_requests: 30776 rows before -> 30776 rows after (+0)
+2026-11-02 12:12:08 | raw_pr_reviews:    21818 rows before -> 21818 rows after (+0)
+2026-11-02 12:12:08 | raw_releases:      204   rows before -> 204   rows after (+0)
+```
+
+### Incremental loads: full vs. incremental request counts
+
+| Run | Mode | scikit-learn | dask | plotly | **Total requests** |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-03 15:57 → 16:58 | Full window (interrupted + resumed) | 5,121 | 1,257 | 729 | **7,107** in the resumed run + ~100 in the interrupted attempt (34 commit pages + 64 PR pages) ≈ **7,200** |
+| 2026-11-03 01:00 | Incremental | 74 | 17 | 24 | **115** |
+| 2026-11-03 15:38 | Incremental | 31 | 6 | 7 | **44** |
+
+An incremental run uses the `_load_state` watermarks: commits with `since=<newest commit date>`, PR pagination stops at the first page older than the newest `updated_at`, and review calls are made **only for PRs updated since the watermark** (e.g. 28 + 3 + 3 PRs in the 15:38 run instead of 7,142). Task 2 then upserts the new records into the existing tables:
+
+```
+2026-11-03 15:39:22 | raw_commits:       7547  rows before -> 7557  rows after (+10)
+2026-11-03 15:39:22 | raw_pull_requests: 30820 rows before -> 30824 rows after (+4)
+2026-11-03 15:39:22 | raw_pr_reviews:    21876 rows before -> 21908 rows after (+32)
+2026-11-03 15:39:22 | raw_releases:      204   rows before -> 204   rows after (+0)
+```
+
+> A note on counts: the November 2 database held ~22,000 extra pre-2024 PRs because an earlier version of extract paged past the window start. The current full run stops at the window start and lands 8,800 PRs (every PR updated since 2024-01-01), of which **7,142 were created in the window** — the same 7,142 that `fct_pull_requests` contained before. No in-window data changed.
+
+---
+
+## Task 3 — dbt transformations and tests
+
+`build_test()` is the only place dbt runs. It calls `dbt build` (every model and test, in dependency order), logs each node's result, and raises if anything errors or fails. Latest result: **47 of 47 models and tests passed** (8 models, 37 generic tests, 2 singular tests).
+
+**Staging models** (views, one per raw table). Each casts timestamps with `::TIMESTAMPTZ`, keeps the latest row per `(repo, id)` with `qualify row_number() over (partition by repo, id order by fetched_at desc) = 1`, and flags bots.
+
+| Model | Columns | Drops |
 | --- | --- | --- |
-| Raw tables | One table per endpoint, one row per record, with the columns above. Every `dbt` model can be rebuilt from these tables without calling the API. | 3 |
-| Idempotent loads | Loads upsert on `(repo, id)` (e.g. `INSERT OR REPLACE` or `MERGE`), never blind inserts. Running Task 2 twice on the same files produces identical row counts; show both counts in the log. | 3 |
-| Incremental loads | A second flow run requests only records updated since the `_load_state` watermark (review calls only for new or updated PRs), and Task 2 upserts them into the existing tables. Log the request count for a full run and an incremental run. | 3 |
+| `stg_commits` | `sha`, `author_login`, `is_bot`, `committed_at` (`commit.author.date`) | — |
+| `stg_pull_requests` | `pr_number`, `author_login`, `is_bot`, `state`, `created_at`, `updated_at`, `closed_at`, `merged_at` | — |
+| `stg_pr_reviews` | `review_id`, `pr_number` (trailing number of `pull_request_url`), `reviewer_login`, `is_bot`, `state`, `submitted_at` | `PENDING` reviews (no `submitted_at`) |
+| `stg_releases` | `release_id`, `tag_name`, `published_at`, `is_prerelease` | Drafts |
 
-## Task 3: `dbt` transformations and tests — 12 points
+**Bot rule** (macro `is_bot` in `macros/helpers.sql`, applied to PR authors, reviewers and commit authors):
 
-A `dbt` project in the repository turns raw JSON into tested staging models and marts with precalculated measures. The Prefect flow runs `dbt build` and fails if any model or test fails. This is the only place in the flow where `dbt` runs. Little cleaning is needed; the work is in the derived measures.
+```sql
+is_bot = user.type = 'Bot' OR user.login LIKE '%[bot]'
+```
 
-A `dbt` Reference is available [here](DBT-REFERENCE.md).
+A missing user (a commit email not linked to a GitHub account, or a deleted account) is treated as **not** a bot: there is no evidence it is automated.
 
-Suggested models (students may add more). Field names refer to the GitHub JSON in `payload` (e.g. `payload->>'created_at'`). **Run time** means `max(fetched_at)` in the raw tables, so a rebuild without new data gives the same results. Convert durations with `date_diff('second', start, end) / 3600.0` for hours or `date_diff('day', start, end)` for days.
+**Mart models** (tables):
 
-| Model | Grain | Precalculated columns |
+| Model | Grain | Key columns |
 | --- | --- | --- |
-| `stg_*` | One per raw endpoint | <ul><li>**All models:** cast timestamps with `::TIMESTAMPTZ` (GitHub returns UTC); keep the latest row per `(repo, id)` using `qualify row_number() over (partition by repo, id order by fetched_at desc) = 1`.</li><li>**Bot rule:** `is_bot = user.type = 'Bot' OR user.login LIKE '%[bot]'`. Apply it to the PR author, the reviewer, and the commit author.</li><li>`stg_commits`: `sha`, `author.login` (can be null when the commit email isn't linked to an account; `is_bot` is then false), `committed_at` from `commit.author.date`.</li><li>`stg_pull_requests`: `number`, `user.login`, `state`, `created_at`, `updated_at`, `closed_at`, `merged_at`.</li><li>`stg_pr_reviews`: `id`, `pr_number` (parse the trailing number from `pull_request_url`), `user.login`, `state`, `submitted_at`. Drop `PENDING` reviews; they have no `submitted_at`.</li><li>`stg_releases`: `id`, `tag_name`, `published_at`, `prerelease`. Drop rows where `draft` is true.</li></ul> |
-| `fct_pull_requests` | One row per PR created on or after 2024-01-01 | <ul><li>`is_merged`: `merged_at IS NOT NULL`.</li><li>`is_closed_unmerged`: `state = 'closed' AND merged_at IS NULL`.</li><li>`is_open`: `state = 'open'` (open at run time).</li><li>`first_review_at`: `min(submitted_at)` from `stg_pr_reviews` for this PR, excluding reviews by the PR author and by bots.</li><li>`hours_to_first_review`: from `created_at` to `first_review_at`. NULL if never reviewed.</li><li>`reviewed_within_7d`: `hours_to_first_review <= 168`. False if never reviewed.</li><li>`hours_to_merge`: from `created_at` to `merged_at`. NULL unless merged.</li><li>`hours_to_close`: from `created_at` to `closed_at`, whether merged or not. NULL if open.</li><li>`is_stale`: `is_open AND updated_at < run time − 180 days`.</li><li>`has_approving_review`: any non-author, non-bot review with `state = 'APPROVED'`.</li></ul> |
-| `fct_releases` | One row per published release on or after 2024-01-01 | <ul><li>`days_since_previous`: `date_diff('day', lag(published_at) over (partition by repo order by published_at), published_at)`. Compute the `lag` **before** filtering to the window, so the first release in the window still measures its gap to the release before it.</li><li>`is_prerelease`: `prerelease`.</li></ul> |
-| `mart_repo_monthly` | Repo × month, January 2024 through the run month | <ul><li>Build the month list with `generate_series` (or a date spine) crossed with the three repos, so months with no activity show 0 instead of disappearing.</li><li>Count each event in the month it happened:<ul><li>`prs_opened`: by `date_trunc('month', created_at)`.</li><li>`prs_merged`: by `merged_at`.</li><li>`prs_closed_unmerged`: by `closed_at` where `is_closed_unmerged`.</li></ul></li><li>`merge_ratio`: `prs_merged / (prs_merged + prs_closed_unmerged)`. NULL when the denominator is 0.</li><li>`median_first_review_hours`: `median(hours_to_first_review)` of PRs opened that month (unreviewed PRs are NULL and fall out).</li><li>`median_merge_hours`: `median(hours_to_merge)` of PRs merged that month.</li><li>`commits`: count of `stg_commits` by `date_trunc('month', committed_at)`.</li><li>`active_contributors`: `count(DISTINCT login)` of non-bot PR authors who opened a PR that month.</li><li>`is_partial_month`: true for the run month.</li></ul> |
-| `mart_health_inputs` | One row per repo | <ul><li>One column per metric you score in Task 5, named for the metric. Every column is a rate, share, median, or slope, never a raw count.</li><li>Examples:<ul><li>`commits_per_week`: total commits ÷ (days in window ÷ 7).</li><li>`pct_reviewed_within_7d`: `avg(reviewed_within_7d::INT)` over PRs created at least 7 days before run time.</li><li>`median_hours_to_merge`: from `fct_pull_requests`.</li><li>`commit_trend`: `regr_slope(commits, month_index)` over complete months of `mart_repo_monthly`.</li><li>`releases_per_year`: releases ÷ (days in window ÷ 365.25).</li></ul></li></ul> |
+| `fct_pull_requests` | PR created on/after 2024-01-01 | `is_merged`, `is_closed_unmerged`, `is_open`, `first_review_at` (excluding the PR author and bots), `hours_to_first_review`, `reviewed_within_7d`, `hours_to_merge`, `hours_to_close`, `is_stale` (open and not updated in 180+ days before run time), `has_approving_review` |
+| `fct_releases` | Published release on/after 2024-01-01 | `days_since_previous` (the `lag` is computed **before** the window filter so the first 2024 release measures its gap to the previous release), `is_prerelease` |
+| `mart_repo_monthly` | Repo × month, Jan 2024 → run month | Month spine from `generate_series` × repos (quiet months show 0); `prs_opened`, `prs_merged`, `prs_closed_unmerged`, `merge_ratio`, `median_first_review_hours`, `median_merge_hours`, `commits`, `active_contributors`, `is_partial_month` |
+| `mart_health_inputs` | Repo | One column per scoreable metric — rates, shares, medians and slopes (see Task 5) |
 
-| Criterion | Full credit requires | Pts |
+**Run time** is `max(fetched_at)` across the raw tables (macro `run_time`), not the wall clock, so rebuilding without new data gives identical results. Durations use `date_diff('second', start, end) / 3600.0` (macro `hours_between`).
+
+**Open PRs and medians.** PRs still open at run time are **kept** in `fct_pull_requests` with `is_open = true`; they are never dropped or given a fake close date. Their `hours_to_merge` and `hours_to_close` are NULL, so they **fall out of the merge-time medians** — those medians describe PRs that actually merged. An open PR that has been reviewed does count toward the time-to-first-review median; a never-reviewed PR (open or not) has NULL `hours_to_first_review` and falls out of that median, but counts as `false` in `reviewed_within_7d`. Open PRs are measured directly by `pct_open_stale`. Currently open: 379 (scikit-learn), 214 (dask), 92 (plotly). Because medians only see completed events, a repo that leaves many PRs open looks faster than it is on the medians; `pct_reviewed_within_7d` and `pct_open_stale` are included in the score to counter this.
+
+**Tests.**
+
+- Generic (`schema.yml`): `unique` + `not_null` on every model's primary key (8/8), `relationships` from `stg_pr_reviews.pr_key` to `stg_pull_requests.pr_key`, and `accepted_values` on PR state (`open`, `closed`) and review state (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`).
+- Singular (`tests/`): `assert_pr_closed_after_created` (no PR closed or merged before it was created) and `assert_review_after_pr_created` (no review submitted before its PR was created). Results print to the screen and to `logs/build_test.log`:
+
+```
+2026-11-03 16:58:18 | INFO | test assert_pr_closed_after_created: pass
+2026-11-03 16:58:18 | INFO | test assert_review_after_pr_created: pass
+2026-11-03 16:58:18 | INFO | Task 3 complete: 47 dbt models/tests passed
+```
+
+**Documentation.** Both `schema.yml` files describe every model and every column, and the four raw tables are declared as dbt sources.
+
+---
+
+## Task 4 — Validation (Python, no dbt)
+
+`validate()` connects to `packages.duckdb` read-only, reads the landing files in `data/raw/`, and raises if any completeness check fails. All results print to the screen and to `logs/validate.log`.
+
+### Completeness checks
+
+1. **Landing files → raw tables.** Every distinct `(repo, endpoint, id)` in `data/raw/` must appear in its raw table (12/12 repo × endpoint pairs passed).
+2. **Raw → staging.** For each repo and table, `raw rows − rows staging drops on purpose (PENDING reviews, draft releases) = staging rows` (12/12 passed).
+3. **Commits in every complete month** (the current partial month is exempt). A zero-commit month fails the task **if that month had merged PRs**: merging a PR creates a commit, so "merges but no commits" means commit data was lost. A month with **zero commits and zero merged PRs** — two independent endpoints agreeing — is logged as a warning instead.
+
+   This matters for one month: **dask had no commits in October 2026.** I confirmed it against GitHub directly: dask's last push was 2026-09-29, and the PR endpoint shows zero merges that month. Failing the flow on a real quiet month would make the pipeline fail on every run, so I chose the cross-endpoint rule above.
+
+```
+OK   dask/dask: 33/34 complete months have commits
+WARN dask/dask: 0 commits AND 0 merged PRs in 2026-10-01 -> real inactivity, not missing data (kept as 0)
+OK   plotly/plotly.py: 34/34 complete months have commits
+OK   scikit-learn/scikit-learn: 34/34 complete months have commits
+```
+
+### Outlier detection
+
+**Time to merge — cutoff: more than 365 days (8,760 hours) from open to merge.** Merge times are extremely right-skewed: a Tukey fence on raw hours (Q3 + 3·IQR) flagged ~11% of perfectly ordinary PRs, and the same fence on log-hours flagged none. A fixed, interpretable one-year cutoff targets the genuinely unusual "open for years" PRs.
+
+| Repo | Flagged | Records |
 | --- | --- | --- |
-| Staging models | One staging model per raw endpoint with typed columns, deduplication, and bot flagging; the bot rule is documented. | 2 |
-| Fact marts | `fct_pull_requests` and `fct_releases` built with the precalculated durations and flags above. | 3 |
-| Aggregate marts | `mart_repo_monthly` and `mart_health_inputs` feed Tasks 4–6 directly; no downstream task recomputes durations in Python. | 2 |
-| Open items | PRs still open at run time are kept and marked open, never dropped or given a fake close date. The README explains how medians treat them. | 1 |
-| Generic tests | `unique` and `not_null` on every primary key, `relationships` from reviews to pull requests, `accepted_values` on state columns. | 1 |
-| Singular tests | Custom SQL tests assert no PR closed or merged before it was created, and no review submitted before its PR was created. Results print to screen and log. | 2 |
-| Documentation | `schema.yml` describes every mart and column; raw tables are declared as dbt sources. | 1 |
+| dask | 0 of 884 merged | — |
+| plotly | 5 of 470 | #5232 (492 days), #5311 (427), #5262 (426), #5310 (426), #5285 (409) — all by one author, opened mid-2025 and merged in a batch in autumn 2026 |
+| scikit-learn | 24 of 3,362 | #28464 (777 days), #29026 (694), #28760 (687), #29532 (627), #29499 (626), #29641 (571), #28043 (541), #29661 (512), #30869 (501), #29155 (492), #31413 (488), #30859 (454), #28971 (450), #29097 (445), #28755 (442), #29307 (440), #30508 (432), #29022 (413), #32042 (407), #31127 (400), #29310 (400), #28559 (391), #30134 (379), #30751 (369) |
 
-## Task 4: Testing and validation — 9 points
+**Weekly commits — cutoff: more than Q3 + 3·IQR of that repo's weekly commit counts** (Tukey "far out" fence, computed per repo). Weekly counts are far less skewed than durations, so a distribution-based fence works well here.
 
-**Task 4 is written in Python and does not run `dbt`.** It runs after Task 3 and uses what Task 3 built as its input. In a Python `@task`, connect to `packages.duckdb` and query the raw tables, staging models, and marts directly with SQL (and pandas or polars if you like), and read the landed JSON files in `data/raw/`. The task confirms that nothing was lost between stages and summarizes the data before modeling. If any check fails, raise an exception so the flow fails.
-
-Task 4 does not repeat Task 3's work. Task 3's `dbt` tests check that each model is internally correct (unique keys, valid states, dates in order). Task 4 checks the pipeline end to end, from landed files to raw tables to staging models, and describes the data.
-
-| Criterion | Full credit requires | Pts |
+| Repo | Cutoff | Flagged weeks |
 | --- | --- | --- |
-| Completeness checks | For each repo and endpoint, every distinct `(repo, id)` record in `data/raw/` appears in the raw table, and the raw table's row count matches its staging model. Every repo has commits in every complete month of the window (the current, partial month is exempt). Any mismatch fails the task. | 3 |
-| Outlier detection | Scan time to merge and weekly commits for values far outside the typical range (for example, a PR open for years or a week with a burst of automated commits). State the cutoff you used, list the records it flags, and say whether you keep, cap, or drop them, and why. | 3 |
-| Descriptive statistics | Per repo: median and 90th percentile time to first review and time to merge; commits per week; releases per year. Read durations from the marts (do not recompute them). Printed to screen and log. | 3 |
+| dask | 46.2 commits/week | 2024-01-08 (80 commits, 0 by bots), 2024-01-15 (72, 0 by bots) |
+| plotly | 87.0 | 2024-10-21 (98, 0 by bots) |
+| scikit-learn | 53.0 | 2025-10-06 (83, 0 by bots) |
 
-Medians and percentiles are required because these durations are heavily right-skewed; a mean alone earns no credit.
+**Decision: keep all flagged records.** They are real events, not data errors: long-running PRs that were eventually merged, and human (not bot) bursts of work. Task 5 scores medians, shares and slopes, which a handful of extreme values barely move, so capping or dropping them would hide real behaviour without changing the ranking.
 
-## Task 5: Health modeling and ranking — 14 points
+### Descriptive statistics
 
-Students build a composite health score from at least four metrics spanning at least three dimensions, then rank the three repos.
+Human-authored PRs, read from `fct_pull_requests` and `mart_health_inputs` (no durations recomputed in Python). Durations in hours.
 
-| Dimension | Example metrics |
+| Repo | Median first review | P90 first review | Median merge | P90 merge | Commits / week | Releases / year |
+| --- | --- | --- | --- | --- | --- | --- |
+| dask | 11.5 | 223.1 | 12.3 | 223.2 | 9.2 | 15.5 |
+| plotly | 16.2 | 701.3 | 41.5 | 1,130.4 | 19.0 | 10.2 |
+| scikit-learn | 12.9 | 277.9 | 36.1 | 843.5 | 22.7 | 5.3 |
+
+The gap between median and P90 (e.g. plotly: 16 h vs. 701 h to first review) is why medians and percentiles are reported rather than means.
+
+---
+
+## Task 5 — Health model and ranking
+
+`model()` reads `mart_health_inputs`, scores the three repos, prints and logs the ranked table, and writes it to `health_scores` (plus every metric's value and z-score to `health_metric_scores`).
+
+### Metrics
+
+Ten metrics across all six dimensions, each a column of `mart_health_inputs`. Bot-authored PRs are excluded from PR metrics.
+
+| Dimension | Metric | Definition | Healthier | dask | plotly | scikit-learn |
+| --- | --- | --- | --- | --- | --- | --- |
+| Activity | `commit_trend_pct` | Slope of monthly commits over complete months ÷ average monthly commits (fractional change per month) | Higher | −0.075 | −0.007 | −0.009 |
+| Responsiveness | `median_hours_to_first_review` | Median hours from PR open to first review by someone other than the author or a bot | Lower | 11.5 | 16.2 | 12.9 |
+| Responsiveness | `pct_reviewed_within_7d` | Share of PRs (opened 7+ days before run time) reviewed within 168 hours | Higher | 0.560 | 0.578 | 0.639 |
+| Throughput | `merge_rate` | Merged ÷ (merged + closed unmerged) | Higher | 0.874 | 0.815 | 0.694 |
+| Throughput | `median_hours_to_merge` | Median hours from open to merge, merged PRs only | Lower | 12.3 | 41.5 | 36.1 |
+| Backlog | `pct_open_stale` | Share of open PRs with no update in 180+ days | Lower | 0.220 | 0.169 | 0.338 |
+| Release cadence | `releases_per_year` | Published releases ÷ (window days ÷ 365.25) | Higher | 15.5 | 10.2 | 5.3 |
+| Release cadence | `release_gap_cv` | Coefficient of variation of days between releases (lower = more regular) | Lower | 0.943 | 0.686 | 0.658 |
+| Contributor base | `bus_factor` | Fewest authors who together account for 50% of merged PRs | Higher | 3 | 2 | 8 |
+| Contributor base | `contributor_trend_pct` | Slope of monthly active PR authors ÷ average monthly active PR authors | Higher | +0.031 | +0.036 | +0.021 |
+
+Stars and forks are not used: they measure popularity, not health.
+
+### Size normalization
+
+scikit-learn has ~4× dask's PRs and ~8× plotly's, so raw counts would simply rank by size. Every scored metric is instead a **share** (`pct_reviewed_within_7d`, `merge_rate`, `pct_open_stale`), a **median** (review and merge times), a **rate per unit of time** (`releases_per_year`), a **dimensionless ratio** (`release_gap_cv`), or a **slope divided by the repo's own average** (`commit_trend_pct`, `contributor_trend_pct`), which turns "commits per month per month" into a percentage change that a small project can win. `commits_per_week` and `active_contributors_per_month` are in the mart but deliberately **not** scored because they mostly measure size.
+
+`bus_factor` is the one count. I kept it because fragility is absolute: a project where two people do half the merging is at risk no matter how big it is. It is balanced inside the contributor dimension by `contributor_trend_pct`, a size-normalized growth rate, on which scikit-learn scores lowest.
+
+### Scoring model
+
+1. **Standardize:** for each metric, z = (value − mean of the 3 repos) ÷ population standard deviation.
+2. **Direction:** multiply by −1 for "lower is healthier" metrics, so a positive z always means healthier than average.
+3. **Dimension subscore:** mean of the signed z-scores of that dimension's metrics.
+4. **Composite score:** weighted sum of the six subscores.
+
+| Dimension | Weight | Why |
+| --- | --- | --- |
+| Responsiveness | 25% | The strongest single signal of a healthy community (#1 in `ASSESSING-HEALTH.md`): a project that acknowledges contributions within days is healthy even if it moves slowly |
+| Contributor base | 20% | Bus factor and contributor growth (#2): concentration of work in a few people makes a project fragile regardless of activity |
+| Throughput | 20% | Whether contributions actually land: merge rate and time to merge (#6) |
+| Backlog | 15% | A growing pile of stale PRs signals overwhelmed maintainers (#5), but it is one metric, so slightly less weight |
+| Activity | 10% | Commit volume and its trend depend heavily on commit habits (and possibly AI-assisted development), so they say less about health (#3, #13) |
+| Release cadence | 10% | Release policy is a project style choice as much as a health signal (#4) |
+
+### Trend component
+
+`commit_trend_pct` and `contributor_trend_pct` are regression slopes over every complete month of the window (`regr_slope` in `mart_health_inputs`), normalized by the repo's own average, so the score reflects the **direction of change**, not just levels.
+
+### Ranking
+
+Signed z-scores (positive = healthier than the three-repo average):
+
+| Metric | dask | plotly | scikit-learn |
+| --- | --- | --- | --- |
+| commit_trend_pct | −1.41 | +0.75 | +0.66 |
+| median_hours_to_first_review | +1.04 | −1.35 | +0.32 |
+| pct_reviewed_within_7d | −0.97 | −0.41 | +1.38 |
+| merge_rate | +1.06 | +0.28 | −1.34 |
+| median_hours_to_merge | +1.39 | −0.91 | −0.48 |
+| pct_open_stale | +0.31 | +1.04 | −1.35 |
+| releases_per_year | +1.24 | −0.03 | −1.21 |
+| release_gap_cv | −1.41 | +0.59 | +0.81 |
+| bus_factor | −0.51 | −0.89 | +1.40 |
+| contributor_trend_pct | +0.25 | +1.08 | −1.33 |
+
+Final ranking (written to `health_scores`):
+
+| Rank | Repo | Responsiveness | Contributor base | Throughput | Backlog | Activity | Release cadence | **Score** |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | dask/dask | +0.035 | −0.129 | +1.228 | +0.314 | −1.413 | −0.085 | **+0.126** |
+| 2 | plotly/plotly.py | −0.882 | +0.096 | −0.317 | +1.037 | +0.753 | +0.283 | **−0.006** |
+| 3 | scikit-learn/scikit-learn | +0.847 | +0.033 | −0.911 | −1.351 | +0.660 | −0.198 | **−0.120** |
+
+**Interpretation.** The three scores are within 0.25 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity; plotly has the healthiest backlog and steady activity but the slowest reviews; scikit-learn is the most responsive and least fragile but has the largest stale backlog and lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask stopped merging PRs after July 2026 (see the monthly trends plot); its window-wide merge metrics still look strong, and only the trend metric captures the slowdown.
+
+---
+
+## Task 6 — Plots
+
+All plots use the same colour per repo (dask orange, plotly green, scikit-learn blue; Okabe-Ito colour-blind-safe palette) and order their legends by final rank.
+
+### Dimension profile
+
+![Dimension profile](plots/dimension_profile.png)
+
+This radar chart shows each repo's subscore on all six scored dimensions; a point further out is healthier, the dashed ring is the three-repo average, and the legend lists the repos in rank order with their composite scores. The shapes barely overlap, which is the main finding: dask's profile is pulled out almost entirely by throughput (+1.23) while it sits furthest inside on activity (−1.41); plotly bulges toward backlog (+1.04) and activity but is weakest on responsiveness (−0.88); scikit-learn is strongest on responsiveness (+0.85) but weakest on backlog (−1.35) and throughput (−0.91). Contributor base and release cadence are close to average for everyone. Because each repo is best at something different, the final order depends on the weights, and the small score gaps (+0.13, −0.01, −0.12) should be read as "roughly comparable" rather than a decisive ranking.
+
+### Trends over time
+
+![Monthly trends](plots/monthly_trends.png)
+
+These eight small multiples come from `mart_repo_monthly` and cover January 2024 to the current (shaded, partial) month, one line per repo. scikit-learn is the largest project by every volume measure: it opens 100–260 PRs a month, and its active PR authors grew from about 51 per month in 2024 to about 84 in 2026. But its closed-without-merge count also rose sharply, from roughly 20 a month in 2024 to 50–90 a month in 2026, pulling its monthly merge ratio from about 0.83 to about 0.55. dask's commits decline steadily from 237 in January 2024 to zero in October 2026, and its merges collapse after July 2026 even though new PRs keep arriving (64 opened in October), so its merge ratio drops to zero. plotly is bursty, with commit spikes of about 250 a month in October–November 2024 and 130–170 a month in spring 2025. Median review and merge times (log scale) stay in a narrow band for scikit-learn (first review 4–31 hours, merge 8–125 hours) but swing by two to three orders of magnitude for the two smaller repos, where a month may contain only a handful of PRs.
+
+### Relationship plot
+
+![Review time vs merge ratio](plots/review_vs_merge_bubbles.png)
+
+Each bubble is one repo-month: x is the median hours to first review that month (log scale), y is the merge ratio, bubble size is the number of active non-bot PR authors, and colour is the repo; the outlined diamonds are each repo's whole-window values. scikit-learn's large bubbles form a tight vertical band at 10–30 hours to first review, so its review speed is very consistent, while its merge ratio spreads from about 0.43 to 0.90, with the low values coming from recent months. dask and plotly's small bubbles scatter across almost three orders of magnitude of review time, which reflects how noisy monthly medians are with few PRs. The bottom-right corner (slow first review, low merge ratio) is almost empty except for dask's late-2026 months, which is the stall visible in the trends plot. Across all three repos there is no strong relationship between how fast a PR is first reviewed and how likely PRs are to be merged that month: fast review is necessary for a healthy project but does not by itself mean contributions get accepted.
+
+---
+
+## Extended items
+
+| Item | Status |
 | --- | --- |
-| Activity | Commits per week; trend slope over the window |
-| Responsiveness | Median time to first PR review; share of PRs reviewed within 7 days; share of merged PRs with an approving review |
-| Throughput | PRs merged ÷ PRs opened per month; merge rate (merged ÷ closed); median time to merge |
-| Backlog | Open-PR growth rate; share of open PRs with no activity in 180+ days |
-| Release cadence | Releases per year; regularity (coefficient of variation of days between releases) |
-| Contributor base | Active PR authors per quarter; bus factor (fewest authors accounting for 50% of merged PRs) |
-
-Stars and forks measure popularity, not health, and do not count toward the four metrics.
-
-| Criterion | Full credit requires | Pts |
-| --- | --- | --- |
-| Metric design | Four or more metrics across three or more dimensions, read from `mart_health_inputs`, each with a written definition and a stated direction (higher or lower is healthier). | 4 |
-| Size normalization | Metrics are normalized so large projects do not win by volume alone (per-contributor rates, ratios, or ranks rather than raw counts). | 3 |
-| Scoring model | Metrics are standardized (z-score, min-max, or rank) and combined with weights the student justifies in writing. | 4 |
-| Trend component | At least one metric captures direction of change (for example, a regression slope over the full window), not only a level. | 2 |
-| Ranking output | A ranked table with score, rank, and per-dimension subscores prints to screen and log and is written back to the database. | 1 |
-
-## Task 6: Multi-dimensional plots — 9 points
-
-The flow saves at least three plots as PNG to a `plots/` directory, committed to the repository. Each plot shows three or more dimensions at once.
-
-| Criterion | Full credit requires | Pts |
-| --- | --- | --- |
-| Dimension profile | A radar chart or small-multiples bar chart showing all three repos across every scored dimension. The plot also shows your final ranking, with repos ordered from healthiest to least healthy (for example, in the legend or panel order, labeled with rank and score). | 2 |
-| Trends over time | Monthly small multiples from `mart_repo_monthly` (one panel per metric, one line per repo) covering the full window. | 3 |
-| Relationship plot | A scatter or bubble chart encoding at least three variables (for example, x = time to first review, y = merge rate, size = active contributors, color = repo). | 2 |
-| Presentation | Titles, labeled axes with units, a consistent color per repo across all plots, and a one-paragraph interpretation of each plot in the README. | 2 |
-
-## Extended process — 8 points
-
-These items separate strong submissions from complete ones.
-
-| Criterion | Full credit requires | Pts |
-| --- | --- | --- |
-| GraphQL ingestion | Rewrite PR and review ingestion against the [**GitHub GraphQL API**](https://docs.github.com/en/graphql) with cursor pagination, tracking the 5,000-point hourly budget from the `rateLimit` field. Log request counts and runtime for REST vs. GraphQL. One GraphQL query can return 100 PRs with their first review, replacing about 100 REST calls. Done early, this cuts a full run from hours to minutes. | 3 |
-| Concurrent fetching | Use Prefect task mapping or async requests to fetch repos in parallel while a shared limiter keeps total usage under the quota. | 2 |
-| Scheduled deployment | A Prefect deployment with a monthly schedule (the 28th) runs the incremental flow; the `DEPLOYMENTS.md` file shows the deployment command and the log of one run you trigger manually from the Prefect UI (the first scheduled run may not occur before the due date). [Read more](DEPLOYMENTS.md). | 2 |
-| API Odometer | Implement an overall tracking mechanism that tracks the total number of API requests per flow run. | 1 |
-
-## Oral interview — 10 points
-
-After submission, each student has a 5-minute interview about their own repository. Expect questions about specific parts of your code and the decisions behind them. You are responsible for understanding everything you submit, including any code produced with AI tools.
-
-| Criterion | Full credit requires | Pts |
-| --- | --- | --- |
-| Code walkthrough | Explains how a piece of code chosen by the interviewer works. | 5 |
-| Design decisions | Justifies a choice they made (for example, metric weights or outlier treatment). | 5 |
-
-Points earned in other sections may be reduced for any component a student cannot explain.
-
-## Point summary
-
-| Section | Points | Score |
-| --- | --- | --- |
-| General requirements | 13 |  |
-| Task 1: Extract from GitHub | 16 |  |
-| Task 2: Load to DuckDB | 9 |  |
-| Task 3: `dbt` transformations and tests | 12 |  |
-| Task 4: Testing and validation | 9 |  |
-| Task 5: Health modeling and ranking | 14 |  |
-| Task 6: Multi-dimensional plots | 9 |  |
-| Extended process | 8 |  |
-| Oral interview | 10 |  |
-| **Total** | **100** |  |
-
-## Grading Notes
-
-As discussed in class I will NOT be grading on the following:
-
-- Speed/latency of your solution. Fast is great but unnecessary in this context.
-- Optimization. It should get the job done, even if there are more refined ways to structure it.
-- The final ranking itself. There is no correct order; grading is based on your metric definitions and weight justification.
-- Exact record counts. The window grows with each run and GitHub data shifts over time, so your counts will not match other students' exactly. Counts must only reconcile within your own pipeline (Task 4).
-- Library and style choices beyond the required tools. `requests` vs. `httpx`, pandas vs. polars, matplotlib vs. plotly, sync vs. async, and formatting are your call, as long as Prefect, DuckDB, and `dbt` are used as specified.
-
-## Reference
-
-[**GitHub API Documentation**](https://docs.github.com/en/rest?apiVersion=2026-03-10)
-- [Commits](https://docs.github.com/en/rest/commits/commits?apiVersion=2026-03-10)
-- [Pull Requests](https://docs.github.com/en/rest/pulls/pulls?apiVersion=2026-03-10)
-- [PR Reviews](https://docs.github.com/en/rest/pulls/reviews?apiVersion=2026-03-10) | [Sample Code](https://github.com/uvasds-systems/ds3022/blob/main/04_apis/09_github_pr_vals.py)
-- [Releases](https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10)
-
-Other:
-- [GitHub Pagination](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api) | [Sample Code](https://github.com/uvasds-systems/ds3022/blob/main/04_apis/05_pagination.py)
-- [GitHub Ratelimits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) | [Sample Code](https://github.com/uvasds-systems/ds3022/blob/main/04_apis/07_github_api_limits.py)
-- [GitHub GraphQL](https://docs.github.com/en/graphql/guides/forming-calls-with-graphql) | [Sample Code](https://github.com/uvasds-systems/ds3022/blob/main/04_apis/08_github_graphql_api.py)
-- [GitHub GraphQL Rate Limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api)
-- [Prefect Documentation](https://docs.prefect.io/v3/get-started)
-- [DBT Documentation](https://docs.getdbt.com/docs/introduction)
-- [dbt DuckDB Adapter Setup](https://docs.getdbt.com/docs/core/connect-data-platform/duckdb-setup)
-
+| API odometer | **Done.** `REQUEST_COUNT` counts every HTTP call to GitHub, including retries; `extract()` logs requests per repo and the total per flow run (`Total API requests this run: 7107` for the resumed full run; 115 and 44 for incremental runs). |
+| GraphQL ingestion | Not attempted |
+| Concurrent fetching | Not attempted |
+| Scheduled deployment | Not attempted |
