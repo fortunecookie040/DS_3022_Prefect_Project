@@ -2,12 +2,20 @@
 # please give your main @flow a name identifiable with your computing ID, such as the example below
 # this will help instructional staff find and review your logs in the prefect server.
 
-from prefect import flow, task, get_run_logger
+from prefect import flow, task, get_run_logger, unmapped
+from prefect.cache_policies import NO_CACHE
+from prefect.futures import wait
+from prefect.runtime import flow_run
 from pathlib import Path
 from contextlib import contextmanager
-import httpx, json, os, time, duckdb, logging, shutil, functools
+from typing import Literal
+import json, os, time, duckdb, logging, shutil, functools
 from datetime import datetime, timezone
 from dbt.cli.main import dbtRunner
+
+from api_client import ODOMETER, rest_get
+from graphql_client import (GRAPHQL_URL, PRS_PER_PAGE, PULLS_QUERY, REVIEWS_QUERY,
+                            graphql_post, to_rest_records)
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -16,10 +24,12 @@ import matplotlib.pyplot as plt
 
 
 START_DATE = "2024-01-01T00:00:00Z"
+PROJECT_DIR = Path(__file__).resolve().parent   # the flow chdirs here so every relative path
+                                                # (incl. dbt's packages.duckdb) works anywhere
 RAW_DIR = Path("data/raw")
 DATABASE = Path("packages.duckdb")
 LOG_DIR = Path("logs")
-DBT_DIR = Path(__file__).parent      # dbt_project.yml + profiles.yml live in the repo root
+DBT_DIR = PROJECT_DIR                # dbt_project.yml + profiles.yml live in the repo root
 API_BASE = "https://api.github.com"
 REPOS = [
     "scikit-learn/scikit-learn",
@@ -35,7 +45,12 @@ ENDPOINT_TABLES = {
     "releases": "raw_releases",
 }
 
-REQUEST_COUNT = {"total": 0}        # API odometer: every HTTP call to GitHub this run
+# GraphQL landing folders; Task 2 reshapes their pages into the REST-style tables above.
+GRAPHQL_ENDPOINTS = {"graphql_pulls", "graphql_reviews"}
+
+# Where the PAT comes from: the TOKEN env var locally, else this Prefect Secret block
+# (used by the scheduled deployment, whose worker pod has no TOKEN variable).
+SECRET_BLOCK = os.environ.get("GH_SECRET_BLOCK", "qtr7bs-pat")
 
 # ---- Task 4: validation settings ----
 # raw table -> (staging model, SQL condition for raw rows staging drops on purpose)
@@ -69,8 +84,9 @@ HEALTH_METRICS = [
      "definition": "Published releases in the window / (window days / 365.25)"},
     {"column": "release_gap_cv", "dimension": "release_cadence", "direction": -1,
      "definition": "Coefficient of variation of days between releases (lower = more regular)"},
-    {"column": "bus_factor", "dimension": "contributor_base", "direction": +1,
-     "definition": "Fewest authors who together account for 50% of merged human PRs"},
+    {"column": "top3_merge_share", "dimension": "contributor_base", "direction": -1,
+     "definition": "Share of merged human PRs authored by the 3 most prolific authors "
+                   "(concentration; a share, so it doesn't grow with project size)"},
     {"column": "contributor_trend_pct", "dimension": "contributor_base", "direction": +1,
      "definition": "Slope of monthly active PR authors / average monthly active PR authors "
                    "(fractional change per month; a second trend component)"},
@@ -174,46 +190,34 @@ def close_dbt_duckdb():
     DuckDBConnectionManager.close_all_connections()
 
 
-def get_page(url, headers, max_tries=5):
-    tries = 0
-    while True:
-        try:
-            REQUEST_COUNT["total"] += 1
-            response = httpx.get(url, headers=headers, timeout=60)
-        except httpx.TransportError:
-            tries += 1
-            if tries >= max_tries:
-                raise
-            time.sleep(2 ** tries)
-            continue
+@functools.cache
+def github_token():
+    """The GitHub PAT: TOKEN env var first, else the Prefect Secret block (deployment)."""
+    token = os.environ.get("TOKEN")
+    if token:
+        return token
+    try:
+        from prefect.blocks.system import Secret
+        return Secret.load(SECRET_BLOCK).get()
+    except Exception as e:
+        raise ValueError(f"No GitHub PAT: set the TOKEN environment variable, or create a "
+                         f"Prefect Secret block named {SECRET_BLOCK!r}") from e
 
-        if response.status_code in (403, 429):
-            remaining = response.headers.get("X-RateLimit-Remaining")
-            reset = response.headers.get("X-RateLimit-Reset")
-            if remaining == "0" and reset:
-                wait = max(1, int(reset) - int(time.time())) + 5
-            elif response.headers.get("Retry-After", "").isdigit():
-                wait = int(response.headers["Retry-After"])
-            else:
-                response.raise_for_status()
-            time.sleep(wait)
-            continue
 
-        if response.status_code >= 500:
-            tries += 1
-            if tries >= max_tries:
-                response.raise_for_status()
-            time.sleep(2 ** tries)
-            continue
+def github_headers():
+    return {"Authorization": f"Bearer {github_token()}",
+            "Accept": "application/vnd.github+json"}
 
-        response.raise_for_status()
 
-        # sleep BEFORE the budget hits zero, not after a 403
-        remaining = int(response.headers.get("X-RateLimit-Remaining", 100))
-        reset = int(response.headers.get("X-RateLimit-Reset", 0))
-        if remaining <= 5:
-            time.sleep(max(1, reset - int(time.time())) + 5)
-        return response
+def landed_records(saved):
+    """[(endpoint, records)] for one landing page.
+
+    REST pages hold one endpoint's records as-is. A GraphQL page holds PRs AND their
+    reviews, so it is reshaped into REST-style "pulls" and "pr_reviews" records.
+    """
+    if saved["endpoint"] in GRAPHQL_ENDPOINTS:
+        return list(to_rest_records(saved).items())
+    return [(saved["endpoint"], saved["data"])]
 
 
 def page_path(repo, endpoint, page, pr_number=None):
@@ -232,7 +236,7 @@ def read_saved(filename):
         return None
 
 
-def save_page(filename, repo, endpoint, page, url, data, next_url, pr_number=None):
+def save_page(filename, repo, endpoint, page, url, data, next_url, pr_number=None, extra=None):
     filename.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "repo": repo,
@@ -241,6 +245,7 @@ def save_page(filename, repo, endpoint, page, url, data, next_url, pr_number=Non
         "page": page,
         "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "next_url": next_url,
+        **(extra or {}),             # GraphQL pages: cursor, next_cursor, variables
         "data": data,
     }
     if pr_number is not None:
@@ -266,8 +271,12 @@ def get_all_pages(repo, endpoint, url, headers, pr_number=None, stop_field=None,
             page += 1
             continue
 
-        response = get_page(url, headers)
-        data = response.json()
+        response = rest_get(url, headers, repo, endpoint, logger)
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise RuntimeError(f"{repo} {endpoint}: page {page} is not valid JSON ({url}): "
+                               f"{response.text[:300]}") from e
 
         next_url = response.links.get("next", {}).get("url")
 
@@ -301,23 +310,118 @@ def get_pull_requests(repo, updated_since=START_DATE):
 
     return pull_requests
 
-@task(retries=3, retry_delay_seconds=[30, 60, 120])
+
+def get_graphql_pages(repo, endpoint, query, variables, connection, headers,
+                      pr_number=None, stop_before=None):
+    """Cursor-paginate one GraphQL connection, writing one landing file per response page.
+
+    `connection(data)` picks the paginated connection out of the response's `data`.
+    Resume works like REST: each saved page stores its `next_cursor`, so pages already on
+    disk are reused and fetching continues from the last good cursor. With `stop_before`
+    (PRs sorted by updatedAt desc) paging stops once a page reaches records older than it.
+    Returns every node across all pages.
+    """
+    logger = get_run_logger()
+    page, cursor, nodes = 1, variables.get("cursor"), []
+    while True:
+        filename = page_path(repo, endpoint, page, pr_number)
+        saved = read_saved(filename)
+        if saved is not None:                               # resume: reuse what's on disk
+            conn, next_cursor = connection(saved["data"]["data"]), saved["next_cursor"]
+        else:
+            page_vars = {**variables, "cursor": cursor}
+            body = graphql_post(query, page_vars, headers, repo, endpoint, logger)
+            conn = connection(body["data"])
+            info = conn["pageInfo"]
+            next_cursor = info["endCursor"] if info["hasNextPage"] else None
+            if stop_before and conn["nodes"] and conn["nodes"][-1]["updatedAt"] < stop_before:
+                next_cursor = None
+            save_page(filename, repo, endpoint, page, GRAPHQL_URL, body, None, pr_number,
+                      extra={"cursor": cursor, "next_cursor": next_cursor, "variables": page_vars})
+        nodes += conn["nodes"]
+        if next_cursor is None:
+            return nodes
+        cursor, page = next_cursor, page + 1
+
+
+def extract_prs_graphql(repo, headers, pulls_cutoff):
+    """PRs + reviews via GraphQL: one query returns 50 PRs with up to 100 reviews each."""
+    logger = get_run_logger()
+    owner, name = repo.split("/")
+    prs = get_graphql_pages(
+        repo, "graphql_pulls", PULLS_QUERY,
+        {"owner": owner, "name": name, "first": PRS_PER_PAGE},
+        lambda d: d["repository"]["pullRequests"], headers, stop_before=pulls_cutoff)
+    reviews = sum(len(pr["reviews"]["nodes"]) for pr in prs)
+
+    # A PR with more than 100 reviews gets follow-up pages, starting from its review cursor.
+    for pr in prs:
+        info = pr["reviews"]["pageInfo"]
+        if info["hasNextPage"]:
+            reviews += len(get_graphql_pages(
+                repo, "graphql_reviews", REVIEWS_QUERY,
+                {"owner": owner, "name": name, "number": pr["number"], "cursor": info["endCursor"]},
+                lambda d: d["repository"]["pullRequest"]["reviews"], headers,
+                pr_number=pr["number"]))
+    in_window = sum(pr["createdAt"] >= START_DATE for pr in prs)
+    logger.info(f"{repo} pulls (GraphQL): {len(prs)} records ({in_window} created in window)")
+    logger.info(f"{repo} pr_reviews (GraphQL): {reviews} records")
+
+
+def extract_prs_rest(repo, headers, pulls_cutoff):
+    """PRs via REST pages, then one REST reviews call per PR created in the window."""
+    logger = get_run_logger()
+    base_url = f"{API_BASE}/repos/{repo}"
+    pulls_url = f"{base_url}/pulls?state=all&sort=updated&direction=desc&per_page=100"
+    get_all_pages(repo, "pulls", pulls_url, headers,
+                  stop_field="updated_at", stop_before=pulls_cutoff)
+
+    pull_requests = get_pull_requests(repo, updated_since=pulls_cutoff)
+    review_total = 0
+    for pr in pull_requests:
+        reviews_url = f"{base_url}/pulls/{pr['number']}/reviews?per_page=100"
+        review_total += get_all_pages(repo, "pr_reviews", reviews_url, headers,
+                                      pr_number=pr["number"])
+    logger.info(f"{repo} pr_reviews: {review_total} records across {len(pull_requests)} PRs")
+
+
+@task(retries=3, retry_delay_seconds=[30, 60, 120], cache_policy=NO_CACHE,
+      task_run_name="extract-{repo}")
+def extract_repo(repo, watermarks, ingest_mode):
+    """Helper task for Task 1: every endpoint for ONE repo. Mapped over the three repos so
+    they download in parallel; the shared limiters in api_client keep the combined request
+    rate under the single token's quota. A retry resumes from the pages already on disk."""
+    logger = get_run_logger()
+    headers = github_headers()
+    started, base_url = time.time(), f"{API_BASE}/repos/{repo}"
+    logger.info(f"Starting extraction for {repo} ({ingest_mode} PRs/reviews)")
+
+    commits_since = watermarks.get((repo, "commits"), START_DATE)
+    get_all_pages(repo, "commits", f"{base_url}/commits?since={commits_since}&per_page=100", headers)
+
+    pulls_cutoff = watermarks.get((repo, "pulls"), START_DATE)
+    if ingest_mode == "graphql":
+        extract_prs_graphql(repo, headers, pulls_cutoff)
+    else:
+        extract_prs_rest(repo, headers, pulls_cutoff)
+
+    get_all_pages(repo, "releases", f"{base_url}/releases?per_page=100", headers)
+
+    seconds = time.time() - started
+    logger.info(f"Finished extraction for {repo} in {seconds:,.0f}s "
+                f"({ODOMETER.total(repo=repo)} API requests so far this run)")
+    return {"repo": repo, "seconds": round(seconds, 1)}
+
+
+@task(retries=1, retry_delay_seconds=60)
 @log_to_file("extract")
-def extract():
+def extract(ingest_mode="graphql"):
     # talks to github and writes files
     # It never writes to DuckDB. Its job is to get every page of every endpoint onto disk, without exceeding the rate limit and without losing work if the run is interrupted.
     logger = get_run_logger()
-    REQUEST_COUNT["total"] = 0
-
-    token = os.environ.get("TOKEN")
-
-    if not token:
-        raise ValueError("Please set the TOKEN environment variable to your GitHub PAT first.")
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
+    if ingest_mode not in ("graphql", "rest"):
+        raise ValueError(f"ingest_mode must be 'graphql' or 'rest', not {ingest_mode!r}")
+    github_token()                       # fail fast, before any threads start, if no PAT
 
     marker = RAW_DIR / "_LOADED"
     if marker.exists():
@@ -328,57 +432,46 @@ def extract():
         logger.info("No _LOADED: last run did not finish loading -> resuming, "
                     "reusing pages already on disk")
     watermarks = read_watermarks()
-    logger.info(f"Mode: {'incremental' if watermarks else 'full window'} run")
-    requests_by_repo = {}
+    run_type = "incremental" if watermarks else "full window"
+    logger.info(f"Mode: {run_type} run, PRs/reviews via {ingest_mode.upper()}, "
+                f"{len(REPOS)} repos fetched in parallel")
 
+    # One mapped helper task per repo. Wait for ALL of them before judging the result, so a
+    # retry of this task never starts while another repo's thread is still writing pages.
+    started = time.time()
+    futures = extract_repo.map(REPOS, watermarks=unmapped(watermarks),
+                               ingest_mode=unmapped(ingest_mode))
+    wait(futures)
+    failed = [repo for repo, f in zip(REPOS, futures) if not f.state.is_completed()]
+    if failed:
+        raise RuntimeError(f"Extraction failed for {failed}; pages already on disk are kept "
+                           f"and the next attempt resumes from them")
+    per_repo = {f.result()["repo"]: f.result()["seconds"] for f in futures}
+    seconds = time.time() - started
+
+    # API odometer: every request this flow run, by API / repo / endpoint.
+    odometer = ODOMETER.rows()
+    logger.info("API odometer (requests sent to GitHub this run, retries included):\n" +
+                "\n".join(f"  {r['api']:<7} {r['repo']:<27} {r['endpoint']:<16} "
+                          f"{r['requests']:>6} requests"
+                          + (f", {r['graphql_points']} points" if r["api"] == "graphql" else "")
+                          for r in odometer))
     for repo in REPOS:
-        logger.info(f"Starting extraction for {repo}")
-        repo_start = REQUEST_COUNT["total"]
-
-        base_url = f"{API_BASE}/repos/{repo}"
-
-        # Download commits
-        commits_since = watermarks.get((repo, "commits"), START_DATE)
-        commits_url = (
-            f"{base_url}/commits?since={commits_since}&per_page=100"
-        )
-        get_all_pages(repo, "commits", commits_url, headers)
-
-        # Download pull requests
-        pulls_cutoff = watermarks.get((repo, "pulls"), START_DATE)
-        pulls_url = (
-            f"{base_url}/pulls?state=all&sort=updated"
-            f"&direction=desc&per_page=100"
-        )
-        get_all_pages(repo, "pulls", pulls_url, headers,
-                      stop_field="updated_at", stop_before=pulls_cutoff)
-
-        # Download reviews for each PR since January 2024
-        pull_requests = get_pull_requests(repo, updated_since=pulls_cutoff)
-        review_total = 0
-
-        for pr in pull_requests:
-            number = pr["number"]
-            reviews_url = (
-                f"{base_url}/pulls/{number}/reviews?per_page=100"
-            )
-
-            review_total += get_all_pages(
-                repo, "pr_reviews", reviews_url,
-                headers, pr_number=number
-            )
-        logger.info(f"{repo} pr_reviews: {review_total} records across {len(pull_requests)} PRs")
-
-        # Download releases
-        releases_url = f"{base_url}/releases?per_page=100"
-        get_all_pages(repo, "releases", releases_url, headers)
-
-        requests_by_repo[repo] = REQUEST_COUNT["total"] - repo_start
-        logger.info(f"Finished extraction for {repo} ({requests_by_repo[repo]} API requests)")
-
-    logger.info(f"Total API requests this run: {REQUEST_COUNT['total']}")
+        logger.info(f"  {repo}: {ODOMETER.total(repo=repo)} requests, {per_repo[repo]:,.0f}s")
+    summary = {
+        "ingest_mode": ingest_mode,
+        "run_type": run_type,
+        "extract_seconds": round(seconds, 1),
+        "rest_requests": ODOMETER.total(api="rest"),
+        "graphql_requests": ODOMETER.total(api="graphql"),
+        "total_requests": ODOMETER.total(),
+        "odometer": odometer,
+    }
+    logger.info(f"Total API requests this run: {summary['total_requests']} "
+                f"({summary['rest_requests']} REST + {summary['graphql_requests']} GraphQL) "
+                f"in {seconds / 60:,.1f} min [{run_type}, {ingest_mode}]")
     logger.info("Task 1 extraction complete!")
-    return {"requests_by_repo": requests_by_repo, "total_requests": REQUEST_COUNT["total"]}
+    return summary
 
 @task(retries=2, retry_delay_seconds=10)
 def load():
@@ -402,29 +495,31 @@ def load():
         for filename in files:
             try:
                 saved = json.loads(filename.read_text())
-                repo, endpoint = saved["repo"], saved["endpoint"]
-                fetched_at, records = saved["fetched_at"], saved["data"]
-            except (json.JSONDecodeError, KeyError) as e:
-                raise ValueError(f"Could not parse landing file {filename}: {e}") from e
+                repo, fetched_at = saved["repo"], saved["fetched_at"]
+                batches = landed_records(saved)      # GraphQL pages -> REST-style records
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                raise ValueError(f"Could not parse landing file {filename}: {e!r}") from e
 
             if repo not in REPOS:
                 raise ValueError(f"Unknown repo in {filename}: {repo}")
-            if endpoint not in ENDPOINT_TABLES:
-                raise ValueError(f"Unknown endpoint in {filename}: {endpoint}")
-            if not isinstance(records, list):
-                raise ValueError(f"Expected a list in 'data' of {filename}")
 
-            key = (repo, endpoint)
-            record_counts[key] = record_counts.get(key, 0) + len(records)
+            for endpoint, records in batches:
+                if endpoint not in ENDPOINT_TABLES:
+                    raise ValueError(f"Unknown endpoint in {filename}: {endpoint}")
+                if not isinstance(records, list):
+                    raise ValueError(f"Expected a list of {endpoint} records in {filename}")
 
-            for record in records:
-                updated_at = get_updated_at(endpoint, record)
-                rows[ENDPOINT_TABLES[endpoint]].append((
-                    repo, get_record_id(endpoint, record), updated_at,
-                    fetched_at, str(filename), json.dumps(record),
-                ))
-                if updated_at and updated_at > newest_dates.get(key, ""):
-                    newest_dates[key] = updated_at
+                key = (repo, endpoint)
+                record_counts[key] = record_counts.get(key, 0) + len(records)
+
+                for record in records:
+                    updated_at = get_updated_at(endpoint, record)
+                    rows[ENDPOINT_TABLES[endpoint]].append((
+                        repo, get_record_id(endpoint, record), updated_at,
+                        fetched_at, str(filename), json.dumps(record),
+                    ))
+                    if updated_at and updated_at > newest_dates.get(key, ""):
+                        newest_dates[key] = updated_at
 
         # 2. Upsert everything in ONE transaction, so a crash leaves the old tables untouched.
         con = duckdb.connect(str(DATABASE))
@@ -567,8 +662,9 @@ def landed_keys():
         saved = read_saved(filename)
         if saved is None:
             raise ValueError(f"Could not parse landing file {filename}")
-        for record in saved["data"]:
-            keys.add((saved["repo"], saved["endpoint"], get_record_id(saved["endpoint"], record)))
+        for endpoint, records in landed_records(saved):     # same reshaping Task 2 uses
+            for record in records:
+                keys.add((saved["repo"], endpoint, get_record_id(endpoint, record)))
     return pd.DataFrame(sorted(keys), columns=["repo", "endpoint", "id"])
 
 
@@ -968,15 +1064,76 @@ def plot():
     return [str(p) for p in paths]
 
 
+@task
+@log_to_file("api_odometer")
+def record_api_usage(summary):
+    """Helper task (after Task 2): save this flow run's API odometer to DuckDB.
+
+    Task 1 must never write to DuckDB, so it only returns its counts; this task appends
+    them to api_odometer (one row per API x repo x endpoint, keyed by flow run) and logs
+    the request history of every recorded run, e.g. full vs. incremental, REST vs. GraphQL.
+    """
+    logger = get_run_logger()
+    run_id = str(flow_run.id or f"local-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}")
+    usage = pd.DataFrame(summary["odometer"],
+                         columns=["api", "repo", "endpoint", "requests", "graphql_points"])
+    usage.insert(0, "flow_run_id", run_id)
+    usage["ingest_mode"] = summary["ingest_mode"]
+    usage["run_type"] = summary["run_type"]
+    usage["extract_seconds"] = summary["extract_seconds"]
+
+    con = duckdb.connect(str(DATABASE))
+    try:
+        con.execute("""
+            create table if not exists api_odometer (
+                flow_run_id VARCHAR, recorded_at TIMESTAMP, api VARCHAR, repo VARCHAR,
+                endpoint VARCHAR, requests INTEGER, graphql_points INTEGER,
+                ingest_mode VARCHAR, run_type VARCHAR, extract_seconds DOUBLE
+            )
+        """)
+        con.register("usage_df", usage)
+        con.execute("delete from api_odometer where flow_run_id = ?", [run_id])   # retry-safe
+        con.execute("insert into api_odometer by name "
+                    "select *, current_timestamp as recorded_at from usage_df")
+        con.unregister("usage_df")
+        history = query(con, """
+            select flow_run_id, min(recorded_at) as recorded_at, any_value(run_type) as run_type,
+                   any_value(ingest_mode) as ingest_mode,
+                   sum(requests) filter (where api = 'rest')    as rest_requests,
+                   sum(requests) filter (where api = 'graphql') as graphql_requests,
+                   sum(requests) as total_requests, sum(graphql_points) as graphql_points,
+                   round(any_value(extract_seconds) / 60, 1) as extract_minutes
+            from api_odometer group by flow_run_id order by recorded_at
+        """)
+    finally:
+        con.close()
+    logger.info(f"Recorded {usage.requests.sum()} requests for flow run {run_id} in api_odometer")
+    logger.info("API odometer history (every recorded flow run):\n"
+                + history.fillna(0).to_string(index=False))
+    return int(usage.requests.sum())
+
+
 @flow(name="qtr7bs-package-health-flow")
-def main():
-    extract()
+def main(ingest_mode: Literal["graphql", "rest"] = "graphql"):
+    """ingest_mode picks how PRs and reviews are fetched: GraphQL (default, minutes) or
+    the original REST path (one reviews call per PR, ~1 hour), kept for comparison."""
+    os.chdir(PROJECT_DIR)        # relative paths (data/, logs/, plots/, dbt's DuckDB path)
+                                 # resolve to the repo, wherever the flow is launched from
+    ODOMETER.reset()             # the odometer counts this flow run only
+    summary = extract(ingest_mode)
     load()
+    record_api_usage(summary)
     build_test()
     validate()
     model()
     plot()
+    get_run_logger().info(f"API odometer: {summary['total_requests']} GitHub API requests this "
+                          f"flow run ({summary['rest_requests']} REST, "
+                          f"{summary['graphql_requests']} GraphQL)")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    # python main.py          -> PRs/reviews via GraphQL (default)
+    # python main.py rest     -> original REST path, for the REST vs. GraphQL comparison
+    main(ingest_mode=sys.argv[1] if len(sys.argv) > 1 else "graphql")

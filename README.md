@@ -19,28 +19,32 @@ GitHub API ─▶ 1 Extract ─▶ data/raw/*.json ─▶ 2 Load ─▶ packages
 **Requirements:** Python 3.13 (the version this was developed and tested on), a GitHub personal access token, and a Prefect API to report to (the class server or a local `prefect server start`).
 
 ```bash
-git clone <this repo> && cd DS_3022_Prefect_Project
+git clone https://github.com/fortunecookie040/DS_3022_Prefect_Project.git && cd DS_3022_Prefect_Project
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt          # pinned: prefect, dbt-core, dbt-duckdb, duckdb, httpx, pandas, numpy, matplotlib
 
 export TOKEN=ghp_your_token_here         # read by extract(); never stored in the repo
-python main.py
+python main.py                           # PRs + reviews via GraphQL (default)
+python main.py rest                      # same flow, PRs + reviews via the original REST path
 ```
+
+If `TOKEN` is not set, the flow falls back to the Prefect Secret block `qtr7bs-pat` (that is how the scheduled deployment gets its token; see [`DEPLOYMENTS.md`](DEPLOYMENTS.md)).
 
 **Expected runtime**
 
 | Run | What happens | Time | API requests |
 | --- | --- | --- | --- |
-| First / full run | No `packages.duckdb` and no `data/raw/`: fetches the whole window | **~1 hour** (my full run: 15:57 → 16:58). Can be longer if the 5,000/hour limit is hit and the flow sleeps until the reset | ~7,200 |
-| Incremental run | `data/raw/_LOADED` exists: fetches only records changed since the last load | **~1 minute** (extract ~25–50 s, tasks 2–6 ~6 s) | 44–115 |
+| First / full run, GraphQL (default) | No `packages.duckdb` and no `data/raw/`: fetches the whole window | **TODO: fill in from the first full GraphQL run** (expected: a few minutes) | TODO |
+| First / full run, REST (`python main.py rest`) | Same, with one REST reviews call per PR | **~1 hour** (my full run: 15:57 → 16:58). Can be longer if the 5,000/hour limit is hit and the flow sleeps until the reset | ~7,200 |
+| Incremental run | `data/raw/_LOADED` exists: fetches only records changed since the last load | **~1 minute** (extract ~25–50 s, tasks 2–6 ~6 s) | 44–115 (REST) |
 
 Keep the machine awake for a full run (e.g. `caffeinate -i python main.py` on macOS).
 
 **Outputs**
 
-- `packages.duckdb` — raw tables, `_load_state`, dbt models, `health_scores`, `health_metric_scores` (git-ignored; rebuilt by the flow)
-- `logs/extract.log`, `load.log`, `build_test.log`, `validate.log`, `model.log`, `plot.log`, and dbt's own `logs/dbt.log` (git-ignored)
+- `packages.duckdb` — raw tables, `_load_state`, dbt models, `health_scores`, `health_metric_scores`, `api_odometer` (git-ignored; rebuilt by the flow)
+- `logs/extract.log`, `load.log`, `api_odometer.log`, `build_test.log`, `validate.log`, `model.log`, `plot.log`, and dbt's own `logs/dbt.log` (git-ignored)
 - `plots/*.png` — committed
 
 > **Harmless exit message:** duckdb 2.0's Python bindings sometimes print `nanobind: leaked N instances!` as the interpreter shuts down. It appears *after* the flow has finished, refers to duckdb's own built-in type objects, and does not affect any results.
@@ -50,6 +54,9 @@ Keep the machine awake for a full run (e.g. `caffeinate -i python main.py` on ma
 | Path | Contents |
 | --- | --- |
 | `main.py` | The Prefect flow and all six tasks |
+| `api_client.py` | Shared rate limiters, the API odometer, and the REST request function used by Task 1 |
+| `graphql_client.py` | GraphQL queries, the GraphQL request function, and the GraphQL → REST-shape conversion used by Tasks 2 and 4 |
+| `deploy.py` | Prefect deployment with the monthly schedule (see `DEPLOYMENTS.md`) |
 | `dbt_project.yml`, `profiles.yml` | dbt project config (profile points at `packages.duckdb`, UTC timezone) |
 | `models/staging/`, `models/marts/` | dbt models and their `schema.yml` documentation/tests |
 | `macros/helpers.sql` | Shared dbt macros: `is_bot`, `run_time`, `window_start`, `hours_between` |
@@ -67,12 +74,12 @@ Keep the machine awake for a full run (e.g. `caffeinate -i python main.py` on ma
 
 **Pagination.** `get_all_pages()` follows the `Link` header's `rel="next"` URL until there is none. For pull requests, which have no date filter, it stops once the oldest PR on a page was last updated before the window start (or, on an incremental run, before the watermark). Record counts are logged per endpoint per repo.
 
-**Rate limiting and HTTP errors** (`get_page()`):
+**Rate limiting and HTTP errors** (`rest_get()` in `api_client.py`):
 
-- Reads `X-RateLimit-Remaining` and `X-RateLimit-Reset` on **every** response; when 5 or fewer requests remain it sleeps until the reset time (+5 s) *before* the budget reaches zero.
+- Reads `X-RateLimit-Remaining` and `X-RateLimit-Reset` on **every** response and stores them in a shared `RateLimiter`. Before each request, if 10 or fewer requests remain, every fetching thread sleeps until the reset time (+5 s) *before* the budget reaches zero.
 - 403/429 secondary limits: sleeps until the reset if the budget is exhausted, otherwise honours `Retry-After`.
 - Network errors and 5xx responses: exponential backoff (2, 4, 8, 16 s), up to 5 tries.
-- Anything still failing raises, and the task-level Prefect retries take over: `@task(retries=3, retry_delay_seconds=[30, 60, 120])`. Because pages already on disk are reused, a retry never re-spends quota.
+- Anything still failing raises with the repo, endpoint and URL in the message, and the task-level Prefect retries take over: the per-repo helper task `extract_repo` has `retries=3, retry_delay_seconds=[30, 60, 120]`. Because pages already on disk are reused, a retry never re-spends quota.
 
 **Landing format.** One file per response page:
 
@@ -319,16 +326,24 @@ Ten metrics across all six dimensions, each a column of `mart_health_inputs`. Bo
 | Backlog | `pct_open_stale` | Share of open PRs with no update in 180+ days | Lower | 0.220 | 0.169 | 0.338 |
 | Release cadence | `releases_per_year` | Published releases ÷ (window days ÷ 365.25) | Higher | 15.5 | 10.2 | 5.3 |
 | Release cadence | `release_gap_cv` | Coefficient of variation of days between releases (lower = more regular) | Lower | 0.943 | 0.686 | 0.658 |
-| Contributor base | `bus_factor` | Fewest authors who together account for 50% of merged PRs | Higher | 3 | 2 | 8 |
+| Contributor base | `top3_merge_share` | Share of merged PRs authored by the repo's 3 most prolific authors (concentration) | Lower | 0.592 | 0.599 | 0.309 |
 | Contributor base | `contributor_trend_pct` | Slope of monthly active PR authors ÷ average monthly active PR authors | Higher | +0.031 | +0.036 | +0.021 |
 
 Stars and forks are not used: they measure popularity, not health.
 
 ### Size normalization
 
-scikit-learn has ~4× dask's PRs and ~8× plotly's, so raw counts would simply rank by size. Every scored metric is instead a **share** (`pct_reviewed_within_7d`, `merge_rate`, `pct_open_stale`), a **median** (review and merge times), a **rate per unit of time** (`releases_per_year`), a **dimensionless ratio** (`release_gap_cv`), or a **slope divided by the repo's own average** (`commit_trend_pct`, `contributor_trend_pct`), which turns "commits per month per month" into a percentage change that a small project can win. `commits_per_week` and `active_contributors_per_month` are in the mart but deliberately **not** scored because they mostly measure size.
+scikit-learn has ~4× dask's PRs and ~8× plotly's, so raw counts would simply rank by size. No scored metric is a raw count. Each one is one of the following:
 
-`bus_factor` is the one count. I kept it because fragility is absolute: a project where two people do half the merging is at risk no matter how big it is. It is balanced inside the contributor dimension by `contributor_trend_pct`, a size-normalized growth rate, on which scikit-learn scores lowest.
+- a **share**: `pct_reviewed_within_7d`, `merge_rate`, `pct_open_stale`, `top3_merge_share`;
+- a **median**: review and merge times;
+- a **rate per unit of time**: `releases_per_year`;
+- a **dimensionless ratio**: `release_gap_cv`;
+- a **slope divided by the repo's own average**: `commit_trend_pct`, `contributor_trend_pct`. This turns "commits per month per month" into a percentage change that a small project can win.
+
+`commits_per_week` and `active_contributors_per_month` are in the mart but deliberately **not** scored, because they mostly measure size.
+
+**Why `top3_merge_share` and not the classic bus factor.** An earlier version scored the bus factor: the fewest authors who together account for 50% of merged PRs. That is a headcount, and headcounts grow with project size. scikit-learn's 575 merging authors gave it a bus factor of 8, against 2–3 for the 88-author projects, mostly because it is bigger. `top3_merge_share` asks the same question about fragility, *how much of the accepted work depends on just three people?*, but as a share. Any project, large or small, can score well on it by spreading its work out. On the current data the conclusion is the same: about 31% of scikit-learn's merged PRs come from its top three authors, against about 60% for dask and plotly. Now that conclusion rests on how widely work is spread, not on scikit-learn's size. The final rank order did not change.
 
 ### Scoring model
 
@@ -340,7 +355,7 @@ scikit-learn has ~4× dask's PRs and ~8× plotly's, so raw counts would simply r
 | Dimension | Weight | Why |
 | --- | --- | --- |
 | Responsiveness | 25% | The strongest single signal of a healthy community (#1 in `ASSESSING-HEALTH.md`): a project that acknowledges contributions within days is healthy even if it moves slowly |
-| Contributor base | 20% | Bus factor and contributor growth (#2): concentration of work in a few people makes a project fragile regardless of activity |
+| Contributor base | 20% | Contributor concentration and growth (#2): when a few people do most of the work, the project is fragile regardless of activity |
 | Throughput | 20% | Whether contributions actually land: merge rate and time to merge (#6) |
 | Backlog | 15% | A growing pile of stale PRs signals overwhelmed maintainers (#5), but it is one metric, so slightly less weight |
 | Activity | 10% | Commit volume and its trend depend heavily on commit habits (and possibly AI-assisted development), so they say less about health (#3, #13) |
@@ -364,18 +379,18 @@ Signed z-scores (positive = healthier than the three-repo average):
 | pct_open_stale | +0.31 | +1.04 | −1.35 |
 | releases_per_year | +1.24 | −0.03 | −1.21 |
 | release_gap_cv | −1.41 | +0.59 | +0.81 |
-| bus_factor | −0.51 | −0.89 | +1.40 |
+| top3_merge_share | −0.68 | −0.73 | +1.41 |
 | contributor_trend_pct | +0.25 | +1.08 | −1.33 |
 
 Final ranking (written to `health_scores`):
 
 | Rank | Repo | Responsiveness | Contributor base | Throughput | Backlog | Activity | Release cadence | **Score** |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | dask/dask | +0.035 | −0.129 | +1.228 | +0.314 | −1.413 | −0.085 | **+0.126** |
-| 2 | plotly/plotly.py | −0.882 | +0.096 | −0.317 | +1.037 | +0.753 | +0.283 | **−0.006** |
-| 3 | scikit-learn/scikit-learn | +0.847 | +0.033 | −0.911 | −1.351 | +0.660 | −0.198 | **−0.120** |
+| 1 | dask/dask | +0.035 | −0.215 | +1.228 | +0.314 | −1.413 | −0.085 | **+0.109** |
+| 2 | plotly/plotly.py | −0.882 | +0.173 | −0.317 | +1.037 | +0.753 | +0.283 | **+0.010** |
+| 3 | scikit-learn/scikit-learn | +0.847 | +0.042 | −0.911 | −1.351 | +0.660 | −0.198 | **−0.119** |
 
-**Interpretation.** The three scores are within 0.25 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity; plotly has the healthiest backlog and steady activity but the slowest reviews; scikit-learn is the most responsive and least fragile but has the largest stale backlog and lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask stopped merging PRs after July 2026 (see the monthly trends plot); its window-wide merge metrics still look strong, and only the trend metric captures the slowdown.
+**Interpretation.** The three scores are within 0.23 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity. plotly has the healthiest backlog and steady activity but the slowest reviews. scikit-learn is the most responsive and has its work spread across the most people, but it has the largest stale backlog and the lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask stopped merging PRs after July 2026 (see the monthly trends plot); its window-wide merge metrics still look strong, and only the trend metric captures the slowdown.
 
 ---
 
@@ -387,7 +402,7 @@ All plots use the same colour per repo (dask orange, plotly green, scikit-learn 
 
 ![Dimension profile](plots/dimension_profile.png)
 
-This radar chart shows each repo's subscore on all six scored dimensions; a point further out is healthier, the dashed ring is the three-repo average, and the legend lists the repos in rank order with their composite scores. The shapes barely overlap, which is the main finding: dask's profile is pulled out almost entirely by throughput (+1.23) while it sits furthest inside on activity (−1.41); plotly bulges toward backlog (+1.04) and activity but is weakest on responsiveness (−0.88); scikit-learn is strongest on responsiveness (+0.85) but weakest on backlog (−1.35) and throughput (−0.91). Contributor base and release cadence are close to average for everyone. Because each repo is best at something different, the final order depends on the weights, and the small score gaps (+0.13, −0.01, −0.12) should be read as "roughly comparable" rather than a decisive ranking.
+This radar chart shows each repo's subscore on all six scored dimensions; a point further out is healthier, the dashed ring is the three-repo average, and the legend lists the repos in rank order with their composite scores. The shapes barely overlap, which is the main finding: dask's profile is pulled out almost entirely by throughput (+1.23) while it sits furthest inside on activity (−1.41); plotly bulges toward backlog (+1.04) and activity but is weakest on responsiveness (−0.88); scikit-learn is strongest on responsiveness (+0.85) but weakest on backlog (−1.35) and throughput (−0.91). Contributor base and release cadence stay close to average for everyone (all within ±0.3). Inside the contributor dimension, scikit-learn's well-spread authorship and dask and plotly's faster contributor growth largely cancel out. Because each repo is best at something different, the final order depends on the weights, and the small score gaps (+0.11, +0.01, −0.12) should be read as "roughly comparable" rather than a decisive ranking.
 
 ### Trends over time
 
@@ -407,7 +422,55 @@ Each bubble is one repo-month: x is the median hours to first review that month 
 
 | Item | Status |
 | --- | --- |
-| API odometer | **Done.** `REQUEST_COUNT` counts every HTTP call to GitHub, including retries; `extract()` logs requests per repo and the total per flow run (`Total API requests this run: 7107` for the resumed full run; 115 and 44 for incremental runs). |
-| GraphQL ingestion | Not attempted |
-| Concurrent fetching | Not attempted |
-| Scheduled deployment | Not attempted |
+| GraphQL ingestion | **Done.** PRs and reviews via GraphQL by default; REST kept as `python main.py rest` |
+| Concurrent fetching | **Done.** The three repos are fetched in parallel by a mapped Prefect task, with a shared rate limiter |
+| Scheduled deployment | **Done.** `deploy.py`, cron `0 0 28 * *` (America/New_York); command and run log in [`DEPLOYMENTS.md`](DEPLOYMENTS.md) |
+| API odometer | **Done.** Every request counted by API, repo and endpoint; logged and saved per flow run in the `api_odometer` table |
+
+### GraphQL ingestion
+
+`graphql_client.py` replaces the REST `pulls` pages **and** the one-call-per-PR REST reviews requests with a single query. Each query returns 50 PRs (sorted by `UPDATED_AT` descending) with up to 100 reviews nested inside each PR:
+
+```graphql
+rateLimit { cost remaining resetAt limit }
+repository(owner: $owner, name: $name) {
+  pullRequests(first: 50, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pageInfo { hasNextPage endCursor }
+    nodes { number state createdAt updatedAt closedAt mergedAt author { __typename login }
+            reviews(first: 100) { pageInfo { hasNextPage endCursor }
+                                  nodes { databaseId state submittedAt author { __typename login } } } }
+  }
+}
+```
+
+- **Cursor pagination.** `get_graphql_pages()` in `main.py` follows `pageInfo.endCursor` while `hasNextPage` is true. As with REST, it stops early once the last PR on a page was updated before the watermark: `START_DATE` on a full run, `_load_state` on an incremental run. A PR with more than 100 reviews gets follow-up pages from its own review cursor (`graphql_reviews/<pr_number>/`).
+- **Point budget.** Every query also asks for `rateLimit`. `remaining` and `resetAt` feed a separate `GraphQL` `RateLimiter`, which sleeps every thread until the reset when 50 or fewer points remain. The points each query cost are added to the odometer.
+- **Errors.** GraphQL can fail with HTTP 200 plus an `errors` array. `RATE_LIMITED` errors sleep until the reset and retry. Any other error raises with the repo and cursor. 403/429 honour `Retry-After`, and 502/504 (a query GitHub gave up on) get backoff retries.
+- **Landing and resume.** Each response is saved unmodified as `data/raw/<repo>/graphql_pulls/page_NNNN.json`, with extra `cursor`, `next_cursor` and `variables` fields. Resume reads `next_cursor` from the last good page, the same way REST uses `next_url`.
+- **Same tables, same dbt.** Task 2 (and Task 4's completeness check) pass each GraphQL page through `to_rest_records()`, which rebuilds REST-style records: `user.login`, `user.type`, lowercase `state` (`MERGED` becomes `closed`, like REST), `merged_at`, `pull_request_url`, and so on. The records land in the existing `raw_pull_requests` / `raw_pr_reviews` tables, so no dbt model changed. Two differences are handled there:
+  - GraphQL bot logins have no `[bot]` suffix (`dependabot` vs. REST's `dependabot[bot]`), so it is added back when `__typename = 'Bot'`.
+  - Deleted accounts come back as `author: null`, which becomes REST's `ghost` user.
+
+**REST vs. GraphQL (full window run, all three repos):**
+
+| Path | REST requests | GraphQL requests (points) | Extract runtime | Source |
+| --- | --- | --- | --- | --- |
+| REST (`python main.py rest`) | 7,107 (resumed run) | 0 | ~58 min | `logs/extract.log`, 2026-11-03 15:59 → 16:58 |
+| GraphQL (default) | TODO | TODO (TODO points) | TODO | TODO: paste the `Total API requests this run` line from the first full GraphQL run |
+
+### Concurrent fetching
+
+`extract()` (Task 1) maps a helper task over the repos: `extract_repo.map(REPOS, ...)`. Prefect runs the three repos on its thread pool at the same time, and they show up as `extract-scikit-learn/scikit-learn`, `extract-dask/dask` and `extract-plotly/plotly.py` in the UI.
+
+- **Shared limiter.** All three threads use one token, so they share one budget. `RateLimiter` (in `api_client.py`) keeps the latest remaining count and reset time under a lock. When the budget reaches the buffer, the thread that notices sleeps *while holding the lock*, so the other repos queue behind it instead of spending the last requests. Each request also reserves one unit before it is sent, and responses that arrive out of order keep the lowest `remaining` seen, so parallel threads can't overcount the budget. REST and GraphQL have separate limiters because GitHub gives them separate 5,000/hour budgets.
+- **Failures.** `extract()` waits for **all** repos to finish or fail before it decides anything. Its own retry therefore never starts while another repo's thread is still writing pages. A failed repo is retried on its own, and resume skips its pages already on disk.
+
+### API odometer
+
+`ODOMETER` (`api_client.py`) counts every HTTP request sent to GitHub during a flow run, including retries. Counts are kept by API (`rest` / `graphql`), repo and endpoint, along with the GraphQL points spent. It is thread-safe and reset at the start of each flow run.
+
+- `extract()` logs a breakdown table and a total line, e.g. `Total API requests this run: 15 (6 REST + 9 GraphQL) in 0.0 min [incremental, graphql]`.
+- The helper task `record_api_usage` (right after Task 2, because Task 1 never writes to DuckDB) appends the counts to an `api_odometer` table keyed by Prefect flow-run ID, then logs the history of every recorded run (`logs/api_odometer.log`).
+- The flow logs a final `API odometer: N GitHub API requests this flow run` line.
+
+Earlier REST-only runs, from before the odometer table existed: 7,107 requests for the resumed full run; 115 and 44 for incremental runs.

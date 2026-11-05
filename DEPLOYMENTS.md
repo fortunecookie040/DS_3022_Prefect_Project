@@ -112,3 +112,39 @@ See the [NYC-Taxi-Monthly](https://sds-prefect.pods.uvarc.io/v2/deployments/depl
 The savvy BSDS student will recognize that some outputs such as plots will not be available since they are built into the remote environment executing the code. This is okay ;^)
 
 (In production the plots would be copied off to remote storage like S3, etc.)
+---
+
+# My deployment (qtr7bs)
+
+**Flow:** `main.py:main` (`qtr7bs-package-health-flow`) · **Deployment:** `qtr7bs-deployment` · **Work pool:** `uvasds-k8s-pool` · **Schedule:** `0 0 28 * *`, America/New_York (midnight Eastern on the 28th of every month)
+
+The deployment is defined in [`deploy.py`](deploy.py):
+
+- **Code.** The worker clones this private repo with `GitRepository(..., credentials={"access_token": Secret.load("qtr7bs-pat")})`. Only a reference to the block is stored in the deployment, never the token itself.
+- **Token.** The flow gets its GitHub token from the same block. `github_token()` in `main.py` uses the `TOKEN` environment variable when it exists and otherwise falls back to `Secret.load("qtr7bs-pat")`, which is what happens on the worker pod.
+- **Job variables.** `job_variables` keeps the CPU and memory values above unchanged. It adds `env.EXTRA_PIP_PACKAGES` (the pinned packages from `requirements.txt`) so the pod installs dbt, duckdb, pandas, etc. at startup, and it keeps the pool's default `HOME=/home/prefect`.
+- **Flow parameter.** `ingest_mode="graphql"`, so the scheduled run fetches PRs and reviews through GraphQL and takes minutes, not about an hour.
+
+**Incremental vs. full on the server.** Each worker pod starts from a fresh clone with no `packages.duckdb` and no `data/raw/`, so `_load_state` is empty and the scheduled run fetches the full window. The same code runs incrementally anywhere the database persists, as it does on my laptop. In production, `packages.duckdb` would live on persistent storage (a volume, S3, or MotherDuck) so the monthly run could be incremental there too. The same applies to the plots (see above).
+
+## Deployment command
+
+Run from the project root after pushing the latest code:
+
+```bash
+python deploy.py
+```
+
+Equivalent CLI form:
+
+```bash
+prefect deploy ./main.py:main --name qtr7bs-deployment --pool uvasds-k8s-pool
+```
+
+## Log of a manually triggered run
+
+Triggered with the **Run** button in the Prefect UI (https://sds-prefect.pods.uvarc.io/v2/deployments).
+
+```
+TODO: paste the flow-run log here (Prefect UI → flow run → Logs, or `prefect flow-run logs <flow-run-id>`)
+```

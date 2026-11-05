@@ -58,27 +58,25 @@ release_stats as (
     group by repo
 ),
 
--- bus factor: fewest authors who together account for >= 50% of merged human PRs
+-- contributor concentration: share of merged human PRs written by the 3 most prolific
+-- authors. A share (not a headcount like the classic bus factor), so it doesn't grow
+-- with project size: it asks how much accepted work depends on just three people.
 author_merges as (
-    select repo, author_login, count(*) as n
-    from {{ ref('fct_pull_requests') }}
-    where is_merged and not author_is_bot and author_login is not null
-    group by all
-),
-
-author_cumulative as (
     select
         repo,
-        sum(n) over (partition by repo order by n desc, author_login
-                     rows between unbounded preceding and current row) - n as merged_before,
-        sum(n) over (partition by repo)                                    as total_merged
-    from author_merges
+        author_login,
+        count(*) as n,
+        row_number() over (partition by repo order by count(*) desc, author_login) as author_rank
+    from {{ ref('fct_pull_requests') }}
+    where is_merged and not author_is_bot and author_login is not null
+    group by repo, author_login
 ),
 
-bus as (
-    select repo, count(*) as bus_factor
-    from author_cumulative
-    where merged_before < 0.5 * total_merged
+concentration as (
+    select
+        repo,
+        sum(n) filter (where author_rank <= 3) / sum(n) as top3_merge_share
+    from author_merges
     group by repo
 )
 
@@ -104,12 +102,12 @@ select
     m.active_contributors_per_month,
     m.contributor_trend,
     m.contributor_trend / nullif(m.active_contributors_per_month, 0) as contributor_trend_pct,  -- size-normalized slope
-    b.bus_factor
+    c.top3_merge_share
 from repos r
 cross join run
 left join commit_stats  cs using (repo)
 left join monthly       m  using (repo)
 left join pr_stats      p  using (repo)
 left join release_stats rs using (repo)
-left join bus           b  using (repo)
+left join concentration c  using (repo)
 order by r.repo
