@@ -19,12 +19,9 @@ GIT_URL = "https://github.com/fortunecookie040/DS_3022_Prefect_Project.git"   # 
 WORK_POOL = "uvasds-k8s-pool"
 DEPLOYMENT_NAME = "qtr7bs-deployment"
 
-# Pinned packages from requirements.txt, installed in the worker pod when it starts
-# (prefect itself is already in the worker image).
-EXTRA_PIP_PACKAGES = " ".join(
-    line.strip() for line in open("requirements.txt")
-    if line.strip() and not line.startswith(("#", "prefect"))
-)
+# No extra packages are installed in the pod: the class worker image
+# (ghcr.io/uvads/prefect-k8s-worker) already ships prefect, dbt, duckdb, pandas, etc. in a
+# read-only site-packages, so pip-installing pinned versions there fails.
 
 if __name__ == "__main__":
     main.from_source(
@@ -44,6 +41,5 @@ if __name__ == "__main__":
             "cpu_limit": "2",
             "memory_request": "2Gi",
             "memory_limit": "4Gi",
-            "env": {"HOME": "/home/prefect", "EXTRA_PIP_PACKAGES": EXTRA_PIP_PACKAGES},
         },
     )
