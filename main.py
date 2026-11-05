@@ -106,6 +106,9 @@ DIMENSION_WEIGHTS = {
 
 # ---- Task 6: plots ----
 PLOTS_DIR = Path("plots")
+# Supplementary bubble chart: only data before this date (dask's maintainers stopped on
+# 2026-09-29, so from October on the three repos are no longer comparable side by side).
+COMPARISON_CUTOFF = "2026-10-01"
 REPO_COLORS = {                     # Okabe-Ito colorblind-safe palette, same color in every plot
     "scikit-learn/scikit-learn": "#0072B2",
     "dask/dask":                 "#E69F00",
@@ -1001,8 +1004,13 @@ def plot_monthly_trends(monthly, scores):
     return path
 
 
-def plot_relationship(monthly, inputs, scores):
-    """Bubble chart: x = review time, y = merge ratio, size = active authors, color = repo."""
+def plot_relationship(monthly, inputs, scores, filename="review_vs_merge_bubbles.png",
+                      period="", diamond_label="whole-window value (diamond)"):
+    """Bubble chart: x = review time, y = merge ratio, size = active authors, color = repo.
+
+    `inputs` supplies the diamonds (one per repo) and needs the columns
+    median_hours_to_first_review, merge_rate and active_contributors_per_month.
+    """
     labels = rank_labels(scores)
     complete = monthly[~monthly.is_partial_month & monthly.median_first_review_hours.gt(0)
                        & monthly.merge_ratio.notna()]
@@ -1023,20 +1031,95 @@ def plot_relationship(monthly, inputs, scores):
     handles += [ax.scatter([], [], s=size(people), color="grey", alpha=0.4,
                            label=f"{people} active PR authors") for people in (5, 25, 75)]
     handles.append(ax.scatter([], [], s=80, color="white", edgecolor="black", marker="D",
-                              label="whole-window value (diamond)"))
+                              label=diamond_label))
 
     ax.set_xscale("log")
     ax.set_xlabel("Median time to first review that month (hours, log scale)")
     ax.set_ylabel("Merge ratio that month (merged / (merged + closed unmerged))")
-    ax.set_title("Faster reviews vs. merge ratio, one bubble per repo-month\n"
+    ax.set_title(f"Faster reviews vs. merge ratio, one bubble per repo-month{period}\n"
                  "bubble size = active non-bot PR authors that month; color = repo")
     ax.grid(alpha=0.3, which="both")
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False,
               labelspacing=1.2)
-    path = PLOTS_DIR / "review_vs_merge_bubbles.png"
+    path = PLOTS_DIR / filename
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def plot_contributor_load(monthly, scores):
+    """Bubble chart: x = active PR authors, y = merge ratio, size = PRs opened, color = repo.
+
+    One point per complete repo-month, plus a least-squares trend line per repo. Each
+    repo's Spearman rank correlation between authors and merge ratio is shown in the
+    legend (rank-based, so a few extreme months can't dominate it).
+    """
+    labels = rank_labels(scores)
+    points = monthly[~monthly.is_partial_month & monthly.merge_ratio.notna()]
+    size = lambda prs: 10 + 2 * prs                 # bubble area per PR opened
+
+    fig, ax = plt.subplots(figsize=(11, 7.5))
+    handles = []
+    for repo in scores.repo:
+        g = points[points.repo == repo]
+        color = REPO_COLORS[repo]
+        ax.scatter(g.active_contributors, g.merge_ratio, s=size(g.prs_opened),
+                   color=color, alpha=0.35, edgecolor="none")
+        slope, intercept = np.polyfit(g.active_contributors, g.merge_ratio, 1)
+        xs = np.linspace(g.active_contributors.min(), g.active_contributors.max(), 200)
+        ys = intercept + slope * xs
+        valid = (ys >= 0) & (ys <= 1)               # a merge ratio only exists in [0, 1]
+        ax.plot(xs[valid], ys[valid], color=color, linewidth=2.5)
+        rho = g.active_contributors.corr(g.merge_ratio, method="spearman")
+        handles.append(plt.Line2D([], [], color=color, marker="o", markersize=9, linewidth=2.5,
+                                  label=f"{labels[repo]}, Spearman ρ = {rho:+.2f}"))
+    handles += [ax.scatter([], [], s=size(prs), color="grey", alpha=0.4,
+                           label=f"{prs} PRs opened that month") for prs in (10, 50, 150)]
+
+    ax.set_xlabel("Active non-bot PR authors that month (people)")
+    ax.set_ylabel("Merge ratio that month (merged / (merged + closed unmerged))")
+    ax.set_title("Busier contributor months, lower merge ratio: one bubble per repo-month\n"
+                 "bubble size = PRs opened that month; color = repo; line = linear trend per repo")
+    ax.set_ylim(-0.03, 1.05)
+    ax.grid(alpha=0.3)
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False,
+              labelspacing=1.2)
+    path = PLOTS_DIR / "contributors_vs_merge_ratio.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def pre_cutoff_inputs(con):
+    """Whole-period diamonds for the pre-October bubble chart, from data before COMPARISON_CUTOFF.
+
+    Same definitions as mart_health_inputs (human-authored PRs only), restricted to
+    events before the cutoff. Durations come precomputed from fct_pull_requests; only
+    medians, counts and averages are taken here.
+    """
+    cutoff = f"timestamptz '{COMPARISON_CUTOFF} 00:00:00+00'"
+    return query(con, f"""
+        with prs as (
+            select
+                repo,
+                median(hours_to_first_review) filter (where first_review_at < {cutoff})
+                    as median_hours_to_first_review,
+                count(*) filter (where merged_at < {cutoff})
+                  / nullif(count(*) filter (where merged_at < {cutoff}
+                                           or (is_closed_unmerged and closed_at < {cutoff})), 0)
+                    as merge_rate
+            from fct_pull_requests
+            where not author_is_bot and created_at < {cutoff}
+            group by repo
+        ),
+        authors as (
+            select repo, avg(active_contributors) as active_contributors_per_month
+            from mart_repo_monthly
+            where month_start < date '{COMPARISON_CUTOFF}'
+            group by repo
+        )
+        select * from prs join authors using (repo)
+    """).set_index("repo")
 
 
 @task
@@ -1048,15 +1131,26 @@ def plot():
         scores = query(con, "select * from health_scores order by rank")
         monthly = query(con, "select * from mart_repo_monthly order by repo, month_start")
         inputs = query(con, "select * from mart_health_inputs").set_index("repo")
+        pre_inputs = pre_cutoff_inputs(con)
     finally:
         con.close()
     monthly["month_start"] = pd.to_datetime(monthly.month_start)
+    pre_monthly = monthly[monthly.month_start < pd.Timestamp(COMPARISON_CUTOFF)]
+    last_month = (pd.Timestamp(COMPARISON_CUTOFF) - pd.offsets.MonthBegin(1)).strftime("%b %Y")
 
     PLOTS_DIR.mkdir(exist_ok=True)
     paths = [
         plot_dimension_profile(scores),
         plot_monthly_trends(monthly, scores),
         plot_relationship(monthly, inputs, scores),
+        # Same chart, before dask's maintainer stall (Oct 2026 on), so the three repos are
+        # compared over a period when all of them were active. Supplementary: scoring and
+        # the other plots still use the full open-ended window.
+        plot_relationship(pre_monthly, pre_inputs, scores,
+                          filename="review_vs_merge_bubbles_pre_oct2026.png",
+                          period=f" (Jan 2024 – {last_month} only)",
+                          diamond_label=f"Jan 2024 – {last_month} value (diamond)"),
+        plot_contributor_load(monthly, scores),
     ]
     for p in paths:
         logger.info(f"Saved {p}")

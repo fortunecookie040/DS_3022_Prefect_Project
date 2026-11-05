@@ -18,7 +18,7 @@ GitHub API ─▶ 1 Extract ─▶ data/raw/*.json ─▶ 2 Load ─▶ packages
 
 ## Setup and running
 
-**Requirements:** Python 3.13 (the version this was developed and tested on), a GitHub personal access token, and a Prefect API to report to (the class server or a local `prefect server start`).
+**Requirements:** Python 3.12 (the version every run in this README used), a GitHub personal access token, and a Prefect API to report to (the class server or a local `prefect server start`).
 
 ```bash
 git clone https://github.com/fortunecookie040/DS_3022_Prefect_Project.git && cd DS_3022_Prefect_Project
@@ -37,11 +37,12 @@ If `TOKEN` is not set, the flow falls back to the Prefect Secret block `qtr7bs-p
 
 | Run | What happens | Time | API requests |
 | --- | --- | --- | --- |
-| First / full run, GraphQL (default) | No `packages.duckdb` and no `data/raw/`: fetches the whole window | **TODO: fill in from the first full GraphQL run** (expected: a few minutes) | TODO |
+| First / full run, GraphQL (default) | No `packages.duckdb` and no `data/raw/`: fetches the whole window | **~3.5 minutes** (my run, 2026-11-04: extract 3.1 min, tasks 2–6 ~10 s) | 266 (81 REST + 185 GraphQL) |
 | First / full run, REST (`python main.py rest`) | Same, with one REST reviews call per PR | **~1 hour** (my full run: 15:57 → 16:58). Can be longer if the 5,000/hour limit is hit and the flow sleeps until the reset | ~7,200 |
-| Incremental run | `data/raw/_LOADED` exists: fetches only records changed since the last load | **~1 minute** (extract ~25–50 s, tasks 2–6 ~6 s) | 44–115 (REST) |
+| Incremental run, GraphQL (default) | `data/raw/_LOADED` exists: fetches only records changed since the last load | **~4 seconds** (extract ~2 s) | 10 (7 REST + 3 GraphQL) |
+| Incremental run, REST | Same, with one REST reviews call per updated PR | **~1 minute** (extract ~25–50 s, tasks 2–6 ~6 s) | 44–115 |
 
-Keep the machine awake for a full run (e.g. `caffeinate -i python main.py` on macOS).
+Keep the machine awake for a full REST run (e.g. `caffeinate -i python main.py rest` on macOS).
 
 **Outputs**
 
@@ -73,6 +74,8 @@ Keep the machine awake for a full run (e.g. `caffeinate -i python main.py` on ma
 `extract()` only talks to GitHub and writes files; it never touches DuckDB.
 
 **Endpoints (per repo).** Commits (`/commits?since=…`), pull requests (`/pulls?state=all&sort=updated&direction=desc`), PR reviews (`/pulls/{number}/reviews`, one call per PR created in the window, merged or not), and releases (`/releases`, fetched in full). Every request uses `per_page=100`.
+
+> **Two ingestion paths.** This section describes the REST path (`python main.py rest`). By default (`python main.py`), pull requests and their reviews come from **one GraphQL query per 50 PRs** instead, and commits and releases still use REST. Both paths land the same records in the same raw tables. See [GraphQL ingestion](#graphql-ingestion).
 
 **Pagination.** `get_all_pages()` follows the `Link` header's `rel="next"` URL until there is none. For pull requests, which have no date filter, it stops once the oldest PR on a page was last updated before the window start (or, on an incremental run, before the watermark). Record counts are logged per endpoint per repo.
 
@@ -194,6 +197,8 @@ From `logs/load.log` — the second load of the same 7,490 files changed nothing
 | 2026-11-03 15:57 → 16:58 | Full window (interrupted + resumed) | 5,121 | 1,257 | 729 | **7,107** in the resumed run + ~100 in the interrupted attempt (34 commit pages + 64 PR pages) ≈ **7,200** |
 | 2026-11-03 01:00 | Incremental | 74 | 17 | 24 | **115** |
 | 2026-11-03 15:38 | Incremental | 31 | 6 | 7 | **44** |
+| 2026-11-04 22:35 | Full window, **GraphQL** | 173 | 44 | 49 | **266** |
+| 2026-11-04 22:47 | Incremental, **GraphQL** | 3 | 3 | 4 | **10** |
 
 An incremental run uses the `_load_state` watermarks: commits with `since=<newest commit date>`, PR pagination stops at the first page older than the newest `updated_at`, and review calls are made **only for PRs updated since the watermark** (e.g. 28 + 3 + 3 PRs in the 15:38 run instead of 7,142). Task 2 then upserts the new records into the existing tables:
 
@@ -240,7 +245,7 @@ A missing user (a commit email not linked to a GitHub account, or a deleted acco
 
 **Run time** is `max(fetched_at)` across the raw tables (macro `run_time`), not the wall clock, so rebuilding without new data gives identical results. Durations use `date_diff('second', start, end) / 3600.0` (macro `hours_between`).
 
-**Open PRs and medians.** PRs still open at run time are **kept** in `fct_pull_requests` with `is_open = true`; they are never dropped or given a fake close date. Their `hours_to_merge` and `hours_to_close` are NULL, so they **fall out of the merge-time medians** — those medians describe PRs that actually merged. An open PR that has been reviewed does count toward the time-to-first-review median; a never-reviewed PR (open or not) has NULL `hours_to_first_review` and falls out of that median, but counts as `false` in `reviewed_within_7d`. Open PRs are measured directly by `pct_open_stale`. Currently open: 379 (scikit-learn), 214 (dask), 92 (plotly). Because medians only see completed events, a repo that leaves many PRs open looks faster than it is on the medians; `pct_reviewed_within_7d` and `pct_open_stale` are included in the score to counter this.
+**Open PRs and medians.** PRs still open at run time are **kept** in `fct_pull_requests` with `is_open = true`; they are never dropped or given a fake close date. Their `hours_to_merge` and `hours_to_close` are NULL, so they **fall out of the merge-time medians** — those medians describe PRs that actually merged. An open PR that has been reviewed does count toward the time-to-first-review median; a never-reviewed PR (open or not) has NULL `hours_to_first_review` and falls out of that median, but counts as `false` in `reviewed_within_7d`. Open PRs are measured directly by `pct_open_stale`. Currently open: 377 (scikit-learn), 220 (dask), 92 (plotly). Because medians only see completed events, a repo that leaves many PRs open looks faster than it is on the medians; `pct_reviewed_within_7d` and `pct_open_stale` are included in the score to counter this.
 
 **Tests.**
 
@@ -283,8 +288,8 @@ OK   scikit-learn/scikit-learn: 34/34 complete months have commits
 | Repo | Flagged | Records |
 | --- | --- | --- |
 | dask | 0 of 884 merged | — |
-| plotly | 5 of 470 | #5232 (492 days), #5311 (427), #5262 (426), #5310 (426), #5285 (409) — all by one author, opened mid-2025 and merged in a batch in autumn 2026 |
-| scikit-learn | 24 of 3,362 | #28464 (777 days), #29026 (694), #28760 (687), #29532 (627), #29499 (626), #29641 (571), #28043 (541), #29661 (512), #30869 (501), #29155 (492), #31413 (488), #30859 (454), #28971 (450), #29097 (445), #28755 (442), #29307 (440), #30508 (432), #29022 (413), #32042 (407), #31127 (400), #29310 (400), #28559 (391), #30134 (379), #30751 (369) |
+| plotly | 5 of 471 | #5232 (492 days), #5311 (427), #5262 (426), #5310 (426), #5285 (409) — all by one author, opened mid-2025 and merged in a batch in autumn 2026 |
+| scikit-learn | 24 of 3,363 | #28464 (777 days), #29026 (694), #28760 (687), #29532 (627), #29499 (626), #29641 (571), #28043 (541), #29661 (512), #30869 (501), #29155 (492), #31413 (488), #30859 (454), #28971 (450), #29097 (445), #28755 (442), #29307 (440), #30508 (432), #29022 (413), #32042 (407), #31127 (400), #29310 (400), #28559 (391), #30134 (379), #30751 (369) |
 
 **Weekly commits — cutoff: more than Q3 + 3·IQR of that repo's weekly commit counts** (Tukey "far out" fence, computed per repo). Weekly counts are far less skewed than durations, so a distribution-based fence works well here.
 
@@ -303,10 +308,10 @@ Human-authored PRs, read from `fct_pull_requests` and `mart_health_inputs` (no d
 | Repo | Median first review | P90 first review | Median merge | P90 merge | Commits / week | Releases / year |
 | --- | --- | --- | --- | --- | --- | --- |
 | dask | 11.5 | 223.1 | 12.3 | 223.2 | 9.2 | 15.5 |
-| plotly | 16.2 | 701.3 | 41.5 | 1,130.4 | 19.0 | 10.2 |
-| scikit-learn | 12.9 | 277.9 | 36.1 | 843.5 | 22.7 | 5.3 |
+| plotly | 16.3 | 698.6 | 41.6 | 1,130.4 | 19.0 | 10.2 |
+| scikit-learn | 13.0 | 277.7 | 36.1 | 843.1 | 22.7 | 5.3 |
 
-The gap between median and P90 (e.g. plotly: 16 h vs. 701 h to first review) is why medians and percentiles are reported rather than means.
+The gap between median and P90 (e.g. plotly: 16 h vs. 699 h to first review) is why medians and percentiles are reported rather than means.
 
 ---
 
@@ -320,15 +325,15 @@ Ten metrics across all six dimensions, each a column of `mart_health_inputs`. Bo
 
 | Dimension | Metric | Definition | Healthier | dask | plotly | scikit-learn |
 | --- | --- | --- | --- | --- | --- | --- |
-| Activity | `commit_trend_pct` | Slope of monthly commits over complete months ÷ average monthly commits (fractional change per month) | Higher | −0.075 | −0.007 | −0.009 |
-| Responsiveness | `median_hours_to_first_review` | Median hours from PR open to first review by someone other than the author or a bot | Lower | 11.5 | 16.2 | 12.9 |
-| Responsiveness | `pct_reviewed_within_7d` | Share of PRs (opened 7+ days before run time) reviewed within 168 hours | Higher | 0.560 | 0.578 | 0.639 |
-| Throughput | `merge_rate` | Merged ÷ (merged + closed unmerged) | Higher | 0.874 | 0.815 | 0.694 |
-| Throughput | `median_hours_to_merge` | Median hours from open to merge, merged PRs only | Lower | 12.3 | 41.5 | 36.1 |
-| Backlog | `pct_open_stale` | Share of open PRs with no update in 180+ days | Lower | 0.220 | 0.169 | 0.338 |
+| Activity | `commit_trend_pct` | Slope of monthly commits over complete months ÷ average monthly commits (fractional change per month) | Higher | −0.075 | −0.006 | −0.009 |
+| Responsiveness | `median_hours_to_first_review` | Median hours from PR open to first review by someone other than the author or a bot | Lower | 11.5 | 16.3 | 13.0 |
+| Responsiveness | `pct_reviewed_within_7d` | Share of PRs (opened 7+ days before run time) reviewed within 168 hours | Higher | 0.559 | 0.578 | 0.639 |
+| Throughput | `merge_rate` | Merged ÷ (merged + closed unmerged) | Higher | 0.874 | 0.814 | 0.693 |
+| Throughput | `median_hours_to_merge` | Median hours from open to merge, merged PRs only | Lower | 12.3 | 41.6 | 36.1 |
+| Backlog | `pct_open_stale` | Share of open PRs with no update in 180+ days | Lower | 0.214 | 0.183 | 0.342 |
 | Release cadence | `releases_per_year` | Published releases ÷ (window days ÷ 365.25) | Higher | 15.5 | 10.2 | 5.3 |
 | Release cadence | `release_gap_cv` | Coefficient of variation of days between releases (lower = more regular) | Lower | 0.943 | 0.686 | 0.658 |
-| Contributor base | `top3_merge_share` | Share of merged PRs authored by the repo's 3 most prolific authors (concentration) | Lower | 0.592 | 0.599 | 0.309 |
+| Contributor base | `top3_merge_share` | Share of merged PRs authored by the repo's 3 most prolific authors (concentration) | Lower | 0.592 | 0.597 | 0.309 |
 | Contributor base | `contributor_trend_pct` | Slope of monthly active PR authors ÷ average monthly active PR authors | Higher | +0.031 | +0.036 | +0.021 |
 
 Stars and forks are not used: they measure popularity, not health.
@@ -345,7 +350,7 @@ scikit-learn has ~4× dask's PRs and ~8× plotly's, so raw counts would simply r
 
 `commits_per_week` and `active_contributors_per_month` are in the mart but deliberately **not** scored, because they mostly measure size.
 
-**Why `top3_merge_share` and not the classic bus factor.** An earlier version scored the bus factor: the fewest authors who together account for 50% of merged PRs. That is a headcount, and headcounts grow with project size. scikit-learn's 575 merging authors gave it a bus factor of 8, against 2–3 for the 88-author projects, mostly because it is bigger. `top3_merge_share` asks the same question about fragility, *how much of the accepted work depends on just three people?*, but as a share. Any project, large or small, can score well on it by spreading its work out. On the current data the conclusion is the same: about 31% of scikit-learn's merged PRs come from its top three authors, against about 60% for dask and plotly. Now that conclusion rests on how widely work is spread, not on scikit-learn's size. The final rank order did not change.
+**Why `top3_merge_share` and not the classic bus factor.** An earlier version scored the bus factor: the fewest authors who together account for 50% of merged PRs. That is a headcount, and headcounts grow with project size. scikit-learn's 575 merging authors gave it a bus factor of 8, against 2–3 for the two projects with about 90 merging authors each, mostly because it is bigger. `top3_merge_share` asks the same question about fragility, *how much of the accepted work depends on just three people?*, but as a share. Any project, large or small, can score well on it by spreading its work out. On the current data the conclusion is the same: about 31% of scikit-learn's merged PRs come from its top three authors, against about 60% for dask and plotly. Now that conclusion rests on how widely work is spread, not on scikit-learn's size. The final rank order did not change.
 
 ### Scoring model
 
@@ -373,26 +378,26 @@ Signed z-scores (positive = healthier than the three-repo average):
 
 | Metric | dask | plotly | scikit-learn |
 | --- | --- | --- | --- |
-| commit_trend_pct | −1.41 | +0.75 | +0.66 |
-| median_hours_to_first_review | +1.04 | −1.35 | +0.32 |
-| pct_reviewed_within_7d | −0.97 | −0.41 | +1.38 |
-| merge_rate | +1.06 | +0.28 | −1.34 |
+| commit_trend_pct | −1.41 | +0.76 | +0.66 |
+| median_hours_to_first_review | +1.04 | −1.35 | +0.31 |
+| pct_reviewed_within_7d | −0.96 | −0.42 | +1.38 |
+| merge_rate | +1.07 | +0.27 | −1.34 |
 | median_hours_to_merge | +1.39 | −0.91 | −0.48 |
-| pct_open_stale | +0.31 | +1.04 | −1.35 |
+| pct_open_stale | +0.47 | +0.92 | −1.39 |
 | releases_per_year | +1.24 | −0.03 | −1.21 |
 | release_gap_cv | −1.41 | +0.59 | +0.81 |
-| top3_merge_share | −0.68 | −0.73 | +1.41 |
+| top3_merge_share | −0.69 | −0.73 | +1.41 |
 | contributor_trend_pct | +0.25 | +1.08 | −1.33 |
 
 Final ranking (written to `health_scores`):
 
 | Rank | Repo | Responsiveness | Contributor base | Throughput | Backlog | Activity | Release cadence | **Score** |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | dask/dask | +0.035 | −0.215 | +1.228 | +0.314 | −1.413 | −0.085 | **+0.109** |
-| 2 | plotly/plotly.py | −0.882 | +0.173 | −0.317 | +1.037 | +0.753 | +0.283 | **+0.010** |
-| 3 | scikit-learn/scikit-learn | +0.847 | +0.042 | −0.911 | −1.351 | +0.660 | −0.198 | **−0.119** |
+| 1 | dask/dask | +0.039 | −0.216 | +1.230 | +0.471 | −1.413 | −0.085 | **+0.133** |
+| 2 | plotly/plotly.py | −0.885 | +0.175 | −0.323 | +0.919 | +0.755 | +0.283 | **−0.009** |
+| 3 | scikit-learn/scikit-learn | +0.847 | +0.041 | −0.907 | −1.390 | +0.658 | −0.198 | **−0.124** |
 
-**Interpretation.** The three scores are within 0.23 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity. plotly has the healthiest backlog and steady activity but the slowest reviews. scikit-learn is the most responsive and has its work spread across the most people, but it has the largest stale backlog and the lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask's merges dwindled after July 2026 and stopped entirely after 2026-09-29. Its window-wide merge metrics still look strong, and only the trend metric captures the slowdown. dask's #1 rank should therefore be read as "historically the healthiest, currently stalled". See the flag below.
+**Interpretation.** The three scores are within 0.26 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity. plotly has the healthiest backlog and steady activity but the slowest reviews. scikit-learn is the most responsive and has its work spread across the most people, but it has the largest stale backlog and the lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask's merges dwindled after July 2026 and stopped entirely after 2026-09-29. Its window-wide merge metrics still look strong, and only the trend metric captures the slowdown. dask's #1 rank should therefore be read as "historically the healthiest, currently stalled". See the flag below.
 
 ### Flag: dask maintainer inactivity
 
@@ -405,10 +410,10 @@ Final ranking (written to `health_scores`):
 | August | 2 | 36 | 1 | 5 | 3 | 21 |
 | September | 1 | 21 | 1 | 6 | 2 | 18 |
 | **October** | **0** | **64** | **0** | **8** | **0** | **43** |
-| November 1–3 (partial) | 0 | 4 | 0 | 2 | 0 | 4 |
+| November 1–4 (partial) | 0 | 10 | 0 | 2 | 0 | 8 |
 
 - **The last activity was a single merge.** The last human review (10:10:55 UTC), the last commit (10:11:02) and the last merge (10:11:03) all happened on **2026-09-29**: one PR was approved and merged, and nothing has landed since. The last release was 2026-08-24. For comparison, dask averaged 76 commits a month in 2024.
-- **Contributors did not leave; maintainers did.** October had dask's **most** active PR authors of the whole window (43) and 64 new PRs. None of them got a review or a merge. Of the 113 PRs opened since August that are still open, **112 have never been reviewed**. That is the pattern `ASSESSING-HEALTH.md` warns about: work arriving with nobody to process it.
+- **Contributors did not leave; maintainers did.** October had dask's **most** active PR authors of the whole window (43) and 64 new PRs. None of them got a review or a merge. Of the 119 PRs opened since August that are still open, **118 have never been reviewed**. That is the pattern `ASSESSING-HEALTH.md` warns about: work arriving with nobody to process it.
 
 **This is not missing data.** The zeros are real, for three reasons:
 - **GitHub agrees.** I checked the GitHub API directly on 2026-11-04: dask's default branch is `main`, the repo is not archived, `pushed_at` is 2026-09-29T10:11:03Z, and `commits?since=2026-10-01` returns 0 commits.
@@ -432,7 +437,7 @@ All plots use the same colour per repo (dask orange, plotly green, scikit-learn 
 
 ![Dimension profile](plots/dimension_profile.png)
 
-This radar chart shows each repo's subscore on all six scored dimensions; a point further out is healthier, the dashed ring is the three-repo average, and the legend lists the repos in rank order with their composite scores. The shapes barely overlap, which is the main finding: dask's profile is pulled out almost entirely by throughput (+1.23) while it sits furthest inside on activity (−1.41); plotly bulges toward backlog (+1.04) and activity but is weakest on responsiveness (−0.88); scikit-learn is strongest on responsiveness (+0.85) but weakest on backlog (−1.35) and throughput (−0.91). Contributor base and release cadence stay close to average for everyone (all within ±0.3). Inside the contributor dimension, scikit-learn's well-spread authorship and dask and plotly's faster contributor growth largely cancel out. Because each repo is best at something different, the final order depends on the weights, and the small score gaps (+0.11, +0.01, −0.12) should be read as "roughly comparable" rather than a decisive ranking.
+This radar chart shows each repo's subscore on all six scored dimensions; a point further out is healthier, the dashed ring is the three-repo average, and the legend lists the repos in rank order with their composite scores. The shapes barely overlap, which is the main finding: dask's profile is pulled out almost entirely by throughput (+1.23) while it sits furthest inside on activity (−1.41); plotly bulges toward backlog (+0.92) and activity but is weakest on responsiveness (−0.89); scikit-learn is strongest on responsiveness (+0.85) but weakest on backlog (−1.39) and throughput (−0.91). Contributor base and release cadence stay close to average for everyone (all within ±0.3). Inside the contributor dimension, scikit-learn's well-spread authorship and dask and plotly's faster contributor growth largely cancel out. Because each repo is best at something different, the final order depends on the weights, and the small score gaps (+0.13, −0.01, −0.12) should be read as "roughly comparable" rather than a decisive ranking.
 
 ### Trends over time
 
@@ -445,6 +450,44 @@ These eight small multiples come from `mart_repo_monthly` and cover January 2024
 ![Review time vs merge ratio](plots/review_vs_merge_bubbles.png)
 
 Each bubble is one repo-month: x is the median hours to first review that month (log scale), y is the merge ratio, bubble size is the number of active non-bot PR authors, and colour is the repo; the outlined diamonds are each repo's whole-window values. scikit-learn's large bubbles form a tight vertical band at 10–30 hours to first review, so its review speed is very consistent, while its merge ratio spreads from about 0.43 to 0.90, with the low values coming from recent months. dask and plotly's small bubbles scatter across almost three orders of magnitude of review time, which reflects how noisy monthly medians are with few PRs. The bottom-right corner (slow first review, low merge ratio) is almost empty except for dask's late-2026 months, which is the stall visible in the trends plot. Across all three repos there is no strong relationship between how fast a PR is first reviewed and how likely PRs are to be merged that month: fast review is necessary for a healthy project but does not by itself mean contributions get accepted.
+
+### Relationship plot, before October 2026 (supplementary)
+
+![Review time vs merge ratio, Jan 2024 to Sep 2026](plots/review_vs_merge_bubbles_pre_oct2026.png)
+
+This is the same chart limited to **January 2024 through September 2026**, the period when all three projects still had active maintainers (see the [dask flag](#flag-dask-maintainer-inactivity)). Its purpose is to compare the repos on equal footing. The cutoff is set by `COMPARISON_CUTOFF` in `main.py`. The monthly bubbles come from `mart_repo_monthly`. The diamonds use the same definitions as `mart_health_inputs` (human-authored PRs), restricted to PRs created, reviewed, merged or closed before 2026-10-01. Scoring and the other plots still use the full open-ended window the assignment specifies.
+
+The main finding is that **the picture barely changes**, so the original chart wasn't being distorted by dask's stall:
+
+- **Why so little moves.** dask's stalled October had no reviews, so it never had a review time to plot on the original chart either, and the partial November is excluded from both charts. Removing October takes away only scikit-learn's and plotly's October bubbles, including scikit-learn's lowest month (merge ratio 0.43). That makes scikit-learn's recent slide look a little milder: its lowest month is now 0.48.
+- **The whole-period diamonds shift only slightly:**
+  - dask's merge ratio rises from 0.874 to 0.883;
+  - plotly's median first review drops from 16.3 h to 15.5 h;
+  - scikit-learn's merge ratio rises from 0.693 to 0.703, and its median first review drops from 13.0 h to 12.8 h.
+
+  The diamonds keep the same order and positions. dask is still the fastest to review and merges the highest share of PRs; scikit-learn reviews almost as fast but merges the lowest share.
+- **The stall is still visible.** dask's two lowest bubbles are September 2026 (merge ratio 0.14) and August 2026 (0.17), the months just before the stall. So even with October excluded, the chart shows dask's maintainers slowing down.
+
+### Contributor load vs. merge ratio
+
+![Active PR authors vs merge ratio](plots/contributors_vs_merge_ratio.png)
+
+Each bubble is one complete repo-month from `mart_repo_monthly`, and the chart encodes four variables:
+
+- **x:** active non-bot PR authors that month;
+- **y:** merge ratio that month;
+- **bubble size:** PRs opened that month;
+- **color:** repo.
+
+Each line is that repo's linear trend, drawn only where a merge ratio can exist (0–1). The legend gives each repo's **Spearman rank correlation** (ρ) between authors and merge ratio. Spearman ranks the months before correlating them, so a few extreme months can't dominate it.
+
+The review-time chart above found no strong relationship. This one does: **in all three repos, months with more active contributors have a lower merge ratio.**
+
+- **scikit-learn shows it most clearly (ρ = −0.76).** Its 17 months with 40–60 active authors have a median merge ratio of 0.82 (range 0.63–0.90). Its 10 months with 80 or more authors have a median of 0.58 (range 0.43–0.76). The trend line falls from about 0.84 to about 0.54 across its range. Contributor growth has outpaced the maintainers' capacity to accept work. This matches its rising closed-without-merge counts in the trends plot and its last-place Throughput subscore.
+- **plotly shows a modest version (ρ = −0.34)**, with a lot of month-to-month noise from its small samples.
+- **dask (ρ = −0.44) is a different story.** Its steep line is driven mostly by the stall months: August 2026 (21 authors, merge ratio 0.17), September (18, 0.14) and October (43, 0.00). Contributors kept arriving after the maintainers had stopped. Without August–October 2026, dask's correlation weakens to −0.26. So for dask, the chart shows maintainers leaving more than load overwhelming them (see the [dask flag](#flag-dask-maintainer-inactivity)).
+
+**Limits.** This is a correlation, not proof of cause. In scikit-learn both variables also trend over time (active authors rose from about 51 a month in 2024 to about 84 in 2026, while the merge ratio fell), so part of the relationship is that shared trend. It still holds without the late-2026 months (ρ = −0.71), which makes it the most robust relationship in the monthly data.
 
 ---
 
@@ -483,10 +526,29 @@ repository(owner: $owner, name: $name) {
 
 **REST vs. GraphQL (full window run, all three repos):**
 
-| Path | REST requests | GraphQL requests (points) | Extract runtime | Source |
-| --- | --- | --- | --- | --- |
-| REST (`python main.py rest`) | 7,107 (resumed run) | 0 | ~58 min | `logs/extract.log`, 2026-11-03 15:59 → 16:58 |
-| GraphQL (default) | TODO | TODO (TODO points) | TODO | TODO: paste the `Total API requests this run` line from the first full GraphQL run |
+| Path | REST requests | GraphQL requests (points) | **Total requests** | Extract runtime | Source |
+| --- | --- | --- | --- | --- | --- |
+| REST (`python main.py rest`) | 7,107 (resumed run) | 0 | **7,107** | ~58 min | `logs/extract.log`, 2026-11-03 15:59 → 16:58 |
+| GraphQL (default) | 81 (commits + releases) | 185 (185 points) | **266** | **3.1 min** | `logs/extract.log`, 2026-11-04 22:35 → 22:38 |
+
+GraphQL needs about **27× fewer requests** and runs about **19× faster**. Most of the REST cost was the one-reviews-call-per-PR rule (5,227 calls for scikit-learn alone). GraphQL gets the reviews inside the PR pages: 127 queries for scikit-learn's 6,350 PRs, plus 11 follow-up queries for PRs with more than 100 reviews. The whole GraphQL flow, Tasks 1–6, took about 3.5 minutes.
+
+```
+2026-11-04 22:38:52 | INFO | Total API requests this run: 266 (81 REST + 185 GraphQL) in 3.1 min [full window, graphql]
+2026-11-04 22:47:02 | INFO | Total API requests this run: 10 (7 REST + 3 GraphQL) in 0.0 min [incremental, graphql]
+```
+
+An incremental GraphQL run needs only **one GraphQL page per repo**: the first page already reaches PRs older than the `_load_state` watermark, so pagination stops there. Run 8 minutes after the full run, it re-fetched 150 PRs and 346 reviews and upserted them, and every raw table stayed at **+0 rows**. That also shows again that loads are idempotent.
+
+**Reconciliation: do REST and GraphQL produce the same data?** I compared the GraphQL database (2026-11-04) with the REST database (2026-11-03), PR by PR and review by review:
+
+- **Reviews match exactly.** On every in-window PR that hadn't changed between the two runs, all **21,732 reviews are identical**: the same review IDs and the same states, with none missing on either side.
+- **GraphQL has more reviews overall (30,493 vs. 21,911), and that is expected.** GraphQL returns the reviews of *every* PR on a page, including PRs created before 2024 that were updated after it (8,572 reviews). The REST path only fetches reviews for PRs created in the window. `fct_pull_requests` only keeps in-window PRs, so the extra history doesn't change any metric.
+- **PRs match.** All in-window PRs are in both versions, with three exceptions, all explained:
+  - 11 PRs appear only in GraphQL; all of them were opened after the REST run.
+  - 1 PR appears only in REST: scikit-learn #35124 was **deleted on GitHub** between the two runs (its URL now returns 404).
+  - The total PR count differs (8,650 vs. 8,800) only because the two paths overshoot the window start by different amounts: REST pages hold 100 PRs, GraphQL pages hold 50.
+- **One login difference, with no effect on scores.** GitHub's Copilot coding agent is `Copilot` in REST and `copilot-swe-agent[bot]` in GraphQL (6 PRs). Both versions flag it as a bot, so no metric changes.
 
 ### Concurrent fetching
 
@@ -499,8 +561,32 @@ repository(owner: $owner, name: $name) {
 
 `ODOMETER` (`api_client.py`) counts every HTTP request sent to GitHub during a flow run, including retries. Counts are kept by API (`rest` / `graphql`), repo and endpoint, along with the GraphQL points spent. It is thread-safe and reset at the start of each flow run.
 
-- `extract()` logs a breakdown table and a total line, e.g. `Total API requests this run: 15 (6 REST + 9 GraphQL) in 0.0 min [incremental, graphql]`.
+- `extract()` logs a breakdown table and a total line. From my full GraphQL run:
+
+  ```
+  API odometer (requests sent to GitHub this run, retries included):
+    graphql dask/dask                   graphql_pulls        29 requests, 29 points
+    graphql plotly/plotly.py            graphql_pulls        17 requests, 17 points
+    graphql plotly/plotly.py            graphql_reviews       1 requests, 1 points
+    graphql scikit-learn/scikit-learn   graphql_pulls       127 requests, 127 points
+    graphql scikit-learn/scikit-learn   graphql_reviews      11 requests, 11 points
+    rest    dask/dask                   commits              14 requests
+    rest    dask/dask                   releases              1 requests
+    rest    plotly/plotly.py            commits              29 requests
+    rest    plotly/plotly.py            releases              2 requests
+    rest    scikit-learn/scikit-learn   commits              34 requests
+    rest    scikit-learn/scikit-learn   releases              1 requests
+  Total API requests this run: 266 (81 REST + 185 GraphQL) in 3.1 min [full window, graphql]
+  ```
 - The helper task `record_api_usage` (right after Task 2, because Task 1 never writes to DuckDB) appends the counts to an `api_odometer` table keyed by Prefect flow-run ID, then logs the history of every recorded run (`logs/api_odometer.log`).
 - The flow logs a final `API odometer: N GitHub API requests this flow run` line.
+
+Odometer history after my two GraphQL runs (`logs/api_odometer.log`):
+
+```
+run_type     ingest_mode  rest_requests  graphql_requests  total_requests  graphql_points  extract_minutes
+full window  graphql               81.0             185.0           266.0           185.0              3.1
+incremental  graphql                7.0               3.0            10.0             3.0              0.0
+```
 
 Earlier REST-only runs, from before the odometer table existed: 7,107 requests for the resumed full run; 115 and 44 for incremental runs.
