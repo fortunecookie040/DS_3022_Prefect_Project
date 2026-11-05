@@ -6,6 +6,8 @@ One Prefect flow (`qtr7bs-package-health-flow` in `main.py`) pulls GitHub activi
 
 The original assignment instructions are in [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
+> **⚠ Flag: dask's maintainer activity has stopped.** dask's last commit, last merge and last human review all happened within a few seconds on **2026-09-29**. Since then contributors have kept opening PRs (64 from 43 people in October 2026), but none have been reviewed or merged. The zero months that follow are **real inactivity, not missing data**: I checked them against GitHub directly. dask still ranks #1 overall, because 33 of its 34 months were healthy. See [Flag: dask maintainer inactivity](#flag-dask-maintainer-inactivity) for the evidence and what it means for the ranking.
+
 ```
 GitHub API ─▶ 1 Extract ─▶ data/raw/*.json ─▶ 2 Load ─▶ packages.duckdb (raw_*) ─▶ 3 dbt build ─▶ stg_* / fct_* / mart_*
                                                                                                      │
@@ -265,7 +267,7 @@ A missing user (a commit email not linked to a GitHub account, or a deleted acco
 2. **Raw → staging.** For each repo and table, `raw rows − rows staging drops on purpose (PENDING reviews, draft releases) = staging rows` (12/12 passed).
 3. **Commits in every complete month** (the current partial month is exempt). A zero-commit month fails the task **if that month had merged PRs**: merging a PR creates a commit, so "merges but no commits" means commit data was lost. A month with **zero commits and zero merged PRs** — two independent endpoints agreeing — is logged as a warning instead.
 
-   This matters for one month: **dask had no commits in October 2026.** I confirmed it against GitHub directly: dask's last push was 2026-09-29, and the PR endpoint shows zero merges that month. Failing the flow on a real quiet month would make the pipeline fail on every run, so I chose the cross-endpoint rule above.
+   This matters for one month: **dask had no commits in October 2026.** I confirmed it against GitHub directly: dask's last push was 2026-09-29, and the PR endpoint shows zero merges that month. Failing the flow on a real quiet month would make the pipeline fail on every run, so I chose the cross-endpoint rule above. See [Flag: dask maintainer inactivity](#flag-dask-maintainer-inactivity) for the full evidence.
 
 ```
 OK   dask/dask: 33/34 complete months have commits
@@ -390,7 +392,35 @@ Final ranking (written to `health_scores`):
 | 2 | plotly/plotly.py | −0.882 | +0.173 | −0.317 | +1.037 | +0.753 | +0.283 | **+0.010** |
 | 3 | scikit-learn/scikit-learn | +0.847 | +0.042 | −0.911 | −1.351 | +0.660 | −0.198 | **−0.119** |
 
-**Interpretation.** The three scores are within 0.23 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity. plotly has the healthiest backlog and steady activity but the slowest reviews. scikit-learn is the most responsive and has its work spread across the most people, but it has the largest stale backlog and the lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask stopped merging PRs after July 2026 (see the monthly trends plot); its window-wide merge metrics still look strong, and only the trend metric captures the slowdown.
+**Interpretation.** The three scores are within 0.23 of each other, so no repo dominates: each leads a different dimension. dask wins on throughput (fast merges, high merge rate) but has the sharpest decline in activity. plotly has the healthiest backlog and steady activity but the slowest reviews. scikit-learn is the most responsive and has its work spread across the most people, but it has the largest stale backlog and the lowest merge rate. A limitation: the level metrics cover the whole window, so they lag recent change. dask's merges dwindled after July 2026 and stopped entirely after 2026-09-29. Its window-wide merge metrics still look strong, and only the trend metric captures the slowdown. dask's #1 rank should therefore be read as "historically the healthiest, currently stalled". See the flag below.
+
+### Flag: dask maintainer inactivity
+
+**What happened.** dask's maintainer activity tapered off through the summer of 2026 and then stopped:
+
+| Month (2026) | Commits | PRs opened | PRs merged | Closed unmerged | Human reviews | Active PR authors |
+| --- | --- | --- | --- | --- | --- | --- |
+| June | 32 | 41 | 31 | 1 | 28 | 13 |
+| July | 11 | 46 | 10 | 8 | 9 | 27 |
+| August | 2 | 36 | 1 | 5 | 3 | 21 |
+| September | 1 | 21 | 1 | 6 | 2 | 18 |
+| **October** | **0** | **64** | **0** | **8** | **0** | **43** |
+| November 1–3 (partial) | 0 | 4 | 0 | 2 | 0 | 4 |
+
+- **The last activity was a single merge.** The last human review (10:10:55 UTC), the last commit (10:11:02) and the last merge (10:11:03) all happened on **2026-09-29**: one PR was approved and merged, and nothing has landed since. The last release was 2026-08-24. For comparison, dask averaged 76 commits a month in 2024.
+- **Contributors did not leave; maintainers did.** October had dask's **most** active PR authors of the whole window (43) and 64 new PRs. None of them got a review or a merge. Of the 113 PRs opened since August that are still open, **112 have never been reviewed**. That is the pattern `ASSESSING-HEALTH.md` warns about: work arriving with nobody to process it.
+
+**This is not missing data.** The zeros are real, for three reasons:
+- **GitHub agrees.** I checked the GitHub API directly on 2026-11-04: dask's default branch is `main`, the repo is not archived, `pushed_at` is 2026-09-29T10:11:03Z, and `commits?since=2026-10-01` returns 0 commits.
+- **The other endpoints agree.** Task 4's cross-endpoint rule treats a month with 0 commits **and** 0 merged PRs as real inactivity, logged as a warning. A month with merges but no commits would mean commit data was lost, and would fail the flow. October also has 0 reviews, so three independent endpoints agree.
+- **Neighbouring months reconcile.** September's commits, PRs opened and PRs merged match GitHub exactly for all three repos, and dask's October is fully populated on the PR side (64 PRs, 8 closures).
+
+**What the data cannot say.** The data does not show *why* the maintainers stopped. A hiatus, a funding or staffing change, or a move of development elsewhere would all look the same here. The pipeline tracks `main` of `dask/dask` only, as the assignment specifies.
+
+**How it affects the scores.**
+- **The trend metric catches it.** `commit_trend_pct` gives dask a signed z-score of −1.41, tied with dask's `release_gap_cv` for the lowest score of any repo on any metric. That drives its last-place Activity subscore.
+- **The level metrics barely move.** They cover January 2024 to the present, and 33 of those 34 months were healthy. `median_hours_to_merge` (12.3 h) describes only PRs that *did* merge, so the PRs stuck since August can't raise it. The never-reviewed PRs do count as `false` in `pct_reviewed_within_7d`, but they are a small share of 34 months of PRs.
+- **The backlog metric hasn't caught it yet.** `pct_open_stale` only counts PRs with no activity for 180+ days. The stuck PRs date from August 2026 onward, so they will start counting as stale in early 2027. Because the window is open-ended, as the assignment specifies, later runs will show this stall more and more in the backlog and responsiveness scores without any code change.
 
 ---
 
